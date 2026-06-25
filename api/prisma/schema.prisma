@@ -1,0 +1,377 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// AutoPay — Prisma Schema
+// Stack: PostgreSQL · Prisma ORM · NestJS · BullMQ · Paystack
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+enum PaymentType {
+  Rent
+  Utilities
+  Staff
+  Loan
+  School
+  Subscription
+  Other
+}
+
+enum Frequency {
+  daily
+  weekly
+  monthly
+  quarterly
+  yearly
+  once
+}
+
+enum ScheduleStatus {
+  active
+  paused
+  cancelled
+  completed
+}
+
+enum TransactionStatus {
+  scheduled
+  pending
+  processing
+  success
+  failed
+  cancelled
+  refunded
+}
+
+enum AlertType {
+  info
+  warn
+  danger
+}
+
+enum PlanTier {
+  personal
+  business
+  enterprise
+}
+
+// ─── USER ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  passwordHash  String
+  phone         String?
+  pin           String?              // hashed 4-digit transaction PIN
+  avatarUrl     String?
+
+  // Plan / subscription
+  plan          PlanTier  @default(personal)
+  planExpiresAt DateTime?
+  betaAccess    Boolean   @default(true)
+
+  // Paystack
+  paystackCustomerCode  String?
+  paystackCustomerId    String?
+
+  // Settings (stored as JSON for flexibility)
+  settings      Json      @default("{\"reminders\":true,\"balance\":true,\"confirmations\":true}")
+
+  // Timestamps
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  lastLoginAt   DateTime?
+  deletedAt     DateTime?           // soft-delete
+
+  // Relations
+  linkedAccounts  LinkedBankAccount[]
+  beneficiaries   Beneficiary[]
+  schedules       PaymentSchedule[]
+  transactions    Transaction[]
+  alerts          Alert[]
+  auditLogs       AuditLog[]
+  sessions        Session[]
+
+  @@map("users")
+}
+
+// ─── SESSION (JWT refresh tokens) ────────────────────────────────────────────
+
+model Session {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken  String    @unique
+  deviceInfo    String?
+  ipAddress     String?
+  expiresAt     DateTime
+  createdAt     DateTime  @default(now())
+  revokedAt     DateTime?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ─── LINKED BANK ACCOUNT ──────────────────────────────────────────────────────
+
+model LinkedBankAccount {
+  id                  String    @id @default(cuid())
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Bank details
+  bankName            String
+  bankCode            String    // Paystack bank code
+  accountNumber       String
+  accountName         String    // confirmed by Paystack name enquiry
+  currency            String    @default("NGN")
+
+  // Paystack tokenisation
+  paystackAuthCode    String?   // reusable authorisation code
+  paystackCardBin     String?
+  paystackLast4       String?
+  paystackExpMonth    String?
+  paystackExpYear     String?
+  paystackChannelType String    @default("bank_account") // bank_account | card
+
+  isDefault           Boolean   @default(false)
+  isVerified          Boolean   @default(false)
+  verifiedAt          DateTime?
+  balance             Decimal?  @db.Decimal(18, 2)   // last known balance (cached)
+  balanceFetchedAt    DateTime?
+
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  schedules           PaymentSchedule[]
+  transactions        Transaction[]
+
+  @@index([userId])
+  @@map("linked_bank_accounts")
+}
+
+// ─── BENEFICIARY ─────────────────────────────────────────────────────────────
+
+model Beneficiary {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name            String
+  bank            String            // display name e.g. "GTBank"
+  bankCode        String            // Paystack bank code
+  accountNumber   String
+  accountName     String            // verified by Paystack
+  currency        String    @default("NGN")
+
+  // Optional
+  email           String?
+  phone           String?
+  nickname        String?
+  note            String?
+  avatarUrl       String?
+  isVerified      Boolean   @default(false)
+  verifiedAt      DateTime?
+
+  // Paystack recipient
+  paystackRecipientCode String?
+  paystackRecipientId   String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  schedules       PaymentSchedule[]
+  transactions    Transaction[]
+
+  @@index([userId])
+  @@unique([userId, accountNumber, bankCode])   // no duplicate recipients per user
+  @@map("beneficiaries")
+}
+
+// ─── PAYMENT SCHEDULE ─────────────────────────────────────────────────────────
+
+model PaymentSchedule {
+  id                String          @id @default(cuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  beneficiaryId     String
+  beneficiary       Beneficiary     @relation(fields: [beneficiaryId], references: [id])
+  sourceAccountId   String?
+  sourceAccount     LinkedBankAccount? @relation(fields: [sourceAccountId], references: [id])
+
+  // Payment info
+  type              PaymentType
+  amount            Decimal         @db.Decimal(18, 2)
+  currency          String          @default("NGN")
+  frequency         Frequency
+  note              String?
+  internalRef       String          @unique @default(cuid()) // AUTOPAY-xxx
+
+  // Schedule dates
+  nextRunAt         DateTime
+  lastRunAt         DateTime?
+  startDate         DateTime        @default(now())
+  endDate           DateTime?       // null = recurring forever
+  maxOccurrences    Int?            // null = unlimited
+  occurrenceCount   Int             @default(0)
+
+  status            ScheduleStatus  @default(active)
+  pausedAt          DateTime?
+  cancelledAt       DateTime?
+  cancelReason      String?
+
+  // BullMQ job tracking
+  bullJobId         String?         // active job id in the queue
+  reminderJobId     String?         // 24h-before reminder job id
+
+  // Metadata
+  metadata          Json?           // extensible: {tags, category, notes}
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  transactions      Transaction[]
+
+  @@index([userId])
+  @@index([nextRunAt])
+  @@index([status])
+  @@map("payment_schedules")
+}
+
+// ─── TRANSACTION ─────────────────────────────────────────────────────────────
+
+model Transaction {
+  id                String            @id @default(cuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scheduleId        String?
+  schedule          PaymentSchedule?  @relation(fields: [scheduleId], references: [id])
+  beneficiaryId     String?
+  beneficiary       Beneficiary?      @relation(fields: [beneficiaryId], references: [id])
+  sourceAccountId   String?
+  sourceAccount     LinkedBankAccount? @relation(fields: [sourceAccountId], references: [id])
+
+  // Payment info
+  amount            Decimal           @db.Decimal(18, 2)
+  fee               Decimal           @db.Decimal(18, 2)  @default(0)
+  currency          String            @default("NGN")
+  type              PaymentType
+  internalRef       String            @unique          // AUTOPAY-TXN-xxx
+  description       String?
+
+  // Paystack data
+  paystackReference String?           @unique
+  paystackTransferId String?
+  paystackStatus    String?           // success | failed | reversed | pending
+  paystackData      Json?             // full Paystack webhook payload
+
+  status            TransactionStatus @default(scheduled)
+  failureReason     String?
+  retryCount        Int               @default(0)
+  nextRetryAt       DateTime?
+  isBulk            Boolean           @default(false)
+  bulkBatchId       String?           // groups bulk payment entries
+
+  initiatedAt       DateTime          @default(now())
+  processedAt       DateTime?
+  settledAt         DateTime?
+
+  @@index([userId])
+  @@index([scheduleId])
+  @@index([status])
+  @@index([paystackReference])
+  @@index([bulkBatchId])
+  @@map("transactions")
+}
+
+// ─── BULK PAYMENT BATCH ───────────────────────────────────────────────────────
+
+model BulkBatch {
+  id              String    @id @default(cuid())
+  userId          String
+  batchRef        String    @unique
+  totalAmount     Decimal   @db.Decimal(18, 2)
+  count           Int
+  successCount    Int       @default(0)
+  failedCount     Int       @default(0)
+  status          String    @default("pending") // pending | processing | completed | failed
+  authorisedAt    DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([userId])
+  @@map("bulk_batches")
+}
+
+// ─── ALERT ───────────────────────────────────────────────────────────────────
+
+model Alert {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type        AlertType @default(info)
+  title       String
+  message     String
+  isRead      Boolean   @default(false)
+  readAt      DateTime?
+
+  // Optional deep-link context
+  scheduleId  String?
+  txnId       String?
+  metadata    Json?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([isRead])
+  @@map("alerts")
+}
+
+// ─── AUDIT LOG ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  action      String    // CREATE_SCHEDULE | CANCEL_SCHEDULE | ADD_BENEFICIARY | etc.
+  entity      String?   // "PaymentSchedule" | "Beneficiary" | ...
+  entityId    String?
+  changes     Json?     // {before, after}
+  ipAddress   String?
+  userAgent   String?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ─── WEBHOOK EVENT (idempotency store) ───────────────────────────────────────
+
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  provider        String    // "paystack"
+  eventId         String    @unique  // Paystack idempotency key
+  event           String    // charge.success | transfer.success | etc.
+  payload         Json
+  processedAt     DateTime?
+  error           String?
+  createdAt       DateTime  @default(now())
+
+  @@index([provider, event])
+  @@map("webhook_events")
+}

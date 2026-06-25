@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "AutoPay",
+    "slug": "autopay-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#0c140c"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "ng.autopay.mobile"
+    },
+    "android": {
+      "package": "ng.autopay.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#0c140c"
+      }
+    },
+    "extra": {
+      "apiUrl": "https://your-api-domain.com/api/v1"
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}
