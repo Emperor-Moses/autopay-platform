@@ -6,8 +6,8 @@ import { JwtAuthGuard }       from "../auth/jwt-auth.guard";
 import { UsersService }       from "./users.service";
 import { UpdateProfileDto }   from "./dto/update-profile.dto";
 import { UpdateSettingsDto }  from "./dto/update-settings.dto";
-import { ChangePasswordDto }  from "./dto/change-password.dto";
 import { LinkBankDto }        from "./dto/link-bank.dto";
+import { ChangePasswordDto }  from "./dto/change-password.dto";
 
 @ApiTags("users")
 @ApiBearerAuth()
@@ -22,7 +22,7 @@ export class UsersController {
   }
 
   @Patch("me")
-  updateMe(@Req() req: any, @Body() dto: UpdateProfileDto) {
+  updateProfile(@Req() req: any, @Body() dto: UpdateProfileDto) {
     return this.users.updateProfile(req.user.id, dto);
   }
 
@@ -31,25 +31,34 @@ export class UsersController {
     return this.users.updateSettings(req.user.id, dto);
   }
 
-  @Patch("me/password")
+  @Post("me/change-password")
   changePassword(@Req() req: any, @Body() dto: ChangePasswordDto) {
     return this.users.changePassword(req.user.id, dto.currentPassword, dto.newPassword);
   }
 
   @Delete("me")
-  deleteMe(@Req() req: any) {
+  deleteAccount(@Req() req: any) {
     return this.users.deleteAccount(req.user.id);
   }
 
   // ── Bank accounts ─────────────────────────────────────────────────────────
+
   @Get("me/bank-accounts")
   getBankAccounts(@Req() req: any) {
     return this.users.getLinkedAccounts(req.user.id);
   }
 
-  @Post("me/bank-accounts")
-  linkBank(@Req() req: any, @Body() dto: LinkBankDto) {
-    return this.users.linkBankAccount(req.user.id, dto);
+  /**
+   * POST /users/me/bank-accounts/initiate-link
+   *
+   * Verifies the bank account via Paystack name-enquiry, then creates a
+   * ₦50 Paystack card charge session and returns the checkout URL.
+   * The mobile app opens this URL in a browser; on success the Paystack
+   * webhook fires and completeLinkAfterFee() creates the LinkedBankAccount.
+   */
+  @Post("me/bank-accounts/initiate-link")
+  initiateLinkFee(@Req() req: any, @Body() dto: LinkBankDto) {
+    return this.users.initiateLinkFee(req.user.id, dto);
   }
 
   @Patch("me/bank-accounts/:id/default")
@@ -60,17 +69,6 @@ export class UsersController {
   @Delete("me/bank-accounts/:id")
   unlinkBank(@Req() req: any, @Param("id") id: string) {
     return this.users.unlinkBankAccount(req.user.id, id);
-  }
-
-  // ── Direct Debit mandate ─────────────────────────────────────────────────
-  @Post("me/bank-accounts/:id/direct-debit/initialize")
-  initializeDirectDebit(@Req() req: any, @Param("id") id: string) {
-    return this.users.initializeDirectDebit(req.user.id, id);
-  }
-
-  @Get("me/bank-accounts/:id/direct-debit/status")
-  getDirectDebitStatus(@Req() req: any, @Param("id") id: string) {
-    return this.users.checkDirectDebitStatus(req.user.id, id);
   }
 
   // ── Paystack customer ─────────────────────────────────────────────────────

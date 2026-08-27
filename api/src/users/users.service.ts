@@ -1,5 +1,5 @@
 import {
-  Injectable, NotFoundException, ConflictException, BadRequestException, Logger,
+  Injectable, NotFoundException, ConflictException, BadRequestException,
 } from "@nestjs/common";
 import * as bcrypt          from "bcrypt";
 import { PrismaService }   from "../common/prisma/prisma.service";
@@ -7,16 +7,23 @@ import { UpdateProfileDto } from "./dto/update-profile.dto";
 import { UpdateSettingsDto } from "./dto/update-settings.dto";
 import { LinkBankDto }      from "./dto/link-bank.dto";
 import axios                from "axios";
+import { v4 as uuid }       from "uuid";
 import { ConfigService }    from "@nestjs/config";
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const LINKING_FEE_KOBO = 5_000;   // ₦50 in kobo
+const LINKING_FEE_NAIRA = 50;
 
 @Injectable()
 export class UsersService {
-  private readonly logger = new Logger(UsersService.name);
-
   constructor(
     private readonly prisma:  PrismaService,
     private readonly config:  ConfigService,
   ) {}
+
+  private get paystackSecret() {
+    return this.config.get<string>("PAYSTACK_SECRET_KEY")!;
+  }
 
   // ── Profile ───────────────────────────────────────────────────────────────
   async getProfile(userId: string) {
@@ -25,24 +32,20 @@ export class UsersService {
       select: {
         id: true, name: true, email: true, phone: true, avatarUrl: true,
         plan: true, planExpiresAt: true, betaAccess: true,
+        linkingFeePaid: true,
         settings: true, createdAt: true, lastLoginAt: true,
-        pin: true,
         _count: {
           select: { beneficiaries: true, schedules: true, transactions: true },
         },
       },
     });
-    const { pin, ...safeUser } = user;
-    return { ...safeUser, hasPin: !!pin };
+    return user;
   }
 
   async updateProfile(userId: string, dto: UpdateProfileDto) {
     const user = await this.prisma.user.update({
       where:  { id: userId },
-      data:   {
-        name:  dto.name,
-        phone: dto.phone,
-      },
+      data:   { name: dto.name, phone: dto.phone },
       select: { id: true, name: true, email: true, phone: true, updatedAt: true },
     });
     await this.prisma.auditLog.create({
@@ -52,12 +55,11 @@ export class UsersService {
   }
 
   async updateSettings(userId: string, dto: UpdateSettingsDto) {
-    const user = await this.prisma.user.update({
+    return this.prisma.user.update({
       where: { id: userId },
       data:  { settings: dto as any },
       select: { id: true, settings: true },
     });
-    return user;
   }
 
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
@@ -74,10 +76,7 @@ export class UsersService {
   }
 
   async deleteAccount(userId: string) {
-    await this.prisma.user.update({
-      where: { id: userId },
-      data:  { deletedAt: new Date() },
-    });
+    await this.prisma.user.update({ where: { id: userId }, data: { deletedAt: new Date() } });
     await this.prisma.session.updateMany({ where: { userId }, data: { revokedAt: new Date() } });
     await this.prisma.auditLog.create({ data: { userId, action: "DELETE_ACCOUNT" } });
     return { message: "Account deactivated" };
@@ -91,50 +90,164 @@ export class UsersService {
     });
   }
 
-  async linkBankAccount(userId: string, dto: LinkBankDto) {
-    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
+  /**
+   * STEP 1 — Initiate the ₦50 card linking fee.
+   *
+   * Creates a Paystack transaction, returns a checkout URL the mobile app
+   * opens in a browser/WebView. The user pays with their card.
+   * On success, Paystack hits the webhook → completeLinkAfterFee() is called.
+   *
+   * The bank account details (accountNumber, bankCode, bankName) are stored
+   * in Paystack's metadata so the webhook can complete the linking.
+   */
+  async initiateLinkFee(userId: string, dto: LinkBankDto) {
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
 
-    // Verify account via Paystack name-enquiry
+    // Check for duplicate before charging
+    const existing = await this.prisma.linkedBankAccount.findFirst({
+      where: { userId, accountNumber: dto.accountNumber, bankCode: dto.bankCode, deletedAt: null },
+    });
+    if (existing) throw new ConflictException("This account is already linked.");
+
+    // Verify the account name via Paystack before charging the fee
     let accountName: string;
     try {
       const { data } = await axios.get(
         `https://api.paystack.co/bank/resolve?account_number=${dto.accountNumber}&bank_code=${dto.bankCode}`,
-        { headers: { Authorization: `Bearer ${paystackSecret}` } },
+        { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
       );
       accountName = data.data.account_name;
     } catch {
       throw new BadRequestException("Could not verify account. Please check the details.");
     }
 
-    // Check for duplicate
-    const existing = await this.prisma.linkedBankAccount.findFirst({
-      where: { userId, accountNumber: dto.accountNumber, bankCode: dto.bankCode, deletedAt: null },
+    const callbackUrl = this.config.get<string>("PAYSTACK_CALLBACK_URL") ??
+      "https://autopay-platform.netlify.app/account-linked";
+
+    const reference = `AUTOPAY-LINK-${uuid().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
+
+    // Initialize Paystack transaction
+    const { data } = await axios.post(
+      "https://api.paystack.co/transaction/initialize",
+      {
+        email:        user.email,
+        amount:       LINKING_FEE_KOBO,          // ₦50 in kobo
+        currency:     "NGN",
+        reference,
+        callback_url: callbackUrl,
+        metadata: {
+          autopay_action:   "LINK_BANK",
+          autopay_user_id:  userId,
+          account_number:   dto.accountNumber,
+          bank_code:        dto.bankCode,
+          bank_name:        dto.bankName,
+          account_name:     accountName,
+          cancel_action:    "discard",
+        },
+        channels: ["card"],   // card only — no bank transfer for this charge
+      },
+      { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
+    );
+
+    await this.prisma.auditLog.create({
+      data: { userId, action: "INITIATE_LINK_FEE", entity: "User", entityId: userId },
     });
-    if (existing) throw new ConflictException("This account is already linked");
 
-    // If first account, make default
-    const count = await this.prisma.linkedBankAccount.count({ where: { userId, deletedAt: null } });
+    return {
+      reference,
+      checkoutUrl:  data.data.authorization_url,
+      accountName,
+      fee:          LINKING_FEE_NAIRA,
+      message:      `Pay ₦${LINKING_FEE_NAIRA} to link your account. Your card will also be saved to collect future service fees.`,
+    };
+  }
 
+  /**
+   * STEP 2 — Called by the Paystack webhook after the ₦50 charge succeeds.
+   *
+   * - Stores the card authorization_code on the user (used for future 0.1% fees)
+   * - Creates the LinkedBankAccount record
+   * - Marks linkingFeePaid = true on the user
+   */
+  async completeLinkAfterFee(payload: {
+    reference:      string;
+    authCode:       string;
+    cardEmail:      string;
+    cardLast4:      string;
+    cardBin:        string;
+    cardExpMonth:   string;
+    cardExpYear:    string;
+    userId:         string;
+    accountNumber:  string;
+    bankCode:       string;
+    bankName:       string;
+    accountName:    string;
+  }) {
+    const {
+      reference, authCode, cardEmail, cardLast4, cardBin,
+      cardExpMonth, cardExpYear, userId,
+      accountNumber, bankCode, bankName, accountName,
+    } = payload;
+
+    // Guard: don't double-link if webhook fires twice
+    const duplicate = await this.prisma.linkedBankAccount.findFirst({
+      where: { userId, accountNumber, bankCode, deletedAt: null },
+    });
+    if (duplicate) return duplicate;
+
+    const count = await this.prisma.linkedBankAccount.count({
+      where: { userId, deletedAt: null },
+    });
+
+    // Save card auth on user for future fee collection
+    await this.prisma.user.update({
+      where: { id: userId },
+      data:  {
+        cardAuthCode:   authCode,
+        cardEmail,
+        linkingFeePaid: true,
+      },
+    });
+
+    // Create the linked bank account
     const account = await this.prisma.linkedBankAccount.create({
       data: {
         userId,
-        bankName:      dto.bankName,
-        bankCode:      dto.bankCode,
-        accountNumber: dto.accountNumber,
+        bankName,
+        bankCode,
+        accountNumber,
         accountName,
-        isDefault:   count === 0,
-        // isVerified here means "Paystack confirmed this account number+bank code
-        // resolves to a real account name" — NOT that direct debit is authorised.
-        // That only happens once mandateStatus reaches "active" below.
-        isVerified:  true,
-        verifiedAt:  new Date(),
-        paystackChannelType: "bank_account",
-        mandateStatus: "none",
+        paystackAuthCode:    authCode,
+        paystackCardBin:     cardBin,
+        paystackLast4:       cardLast4,
+        paystackExpMonth:    cardExpMonth,
+        paystackExpYear:     cardExpYear,
+        paystackChannelType: "card",
+        linkingFeeRef:       reference,
+        linkingFeePaid:      true,
+        isDefault:           count === 0,
+        isVerified:          true,
+        verifiedAt:          new Date(),
       },
     });
 
     await this.prisma.auditLog.create({
-      data: { userId, action: "LINK_BANK", entity: "LinkedBankAccount", entityId: account.id },
+      data: {
+        userId,
+        action:   "LINK_BANK_COMPLETE",
+        entity:   "LinkedBankAccount",
+        entityId: account.id,
+      },
+    });
+
+    // Notify user
+    await this.prisma.alert.create({
+      data: {
+        userId,
+        type:    "success",
+        title:   "✅ Account Linked",
+        message: `Your ${bankName} account ending in ${accountNumber.slice(-4)} has been linked successfully.`,
+      },
     });
 
     return account;
@@ -145,11 +258,10 @@ export class UsersService {
       where: { userId },
       data:  { isDefault: false },
     });
-    const account = await this.prisma.linkedBankAccount.update({
+    return this.prisma.linkedBankAccount.update({
       where: { id: accountId, userId } as any,
       data:  { isDefault: true },
     });
-    return account;
   }
 
   async unlinkBankAccount(userId: string, accountId: string) {
@@ -157,24 +269,6 @@ export class UsersService {
       where: { sourceAccountId: accountId, status: "active" },
     });
     if (has) throw new BadRequestException("This account has active schedules. Cancel them first.");
-
-    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId } });
-    if (!account) throw new NotFoundException("Account not found");
-
-    // If a direct debit mandate is active, deactivate it on Paystack's side too
-    if (account.paystackAuthCode) {
-      try {
-        await axios.post(
-          "https://api.paystack.co/customer/authorization/deactivate",
-          { authorization_code: account.paystackAuthCode },
-          { headers: { Authorization: `Bearer ${this.config.get("PAYSTACK_SECRET_KEY")}` } },
-        );
-      } catch {
-        // Non-fatal — log and continue unlinking locally even if Paystack call fails
-        this.logger.warn(`Could not deactivate Paystack authorization for account ${accountId}`);
-      }
-    }
-
     await this.prisma.linkedBankAccount.update({
       where: { id: accountId },
       data:  { deletedAt: new Date() },
@@ -185,105 +279,27 @@ export class UsersService {
     return { message: "Account unlinked" };
   }
 
-  // ── Direct Debit mandate ──────────────────────────────────────────────────
-  // Step 1: kick off the mandate authorization request. Returns a redirect_url
-  // that the mobile app must open (in-app browser / WebView) so the customer
-  // can give consent on their bank's flow.
-  async initializeDirectDebit(userId: string, accountId: string) {
-    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId, deletedAt: null } });
-    if (!account) throw new NotFoundException("Linked account not found");
-    if (account.mandateStatus === "active") {
-      throw new BadRequestException("This account is already authorised for direct debit");
-    }
-
-    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
-    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
-    const appCallbackUrl = this.config.get("DIRECT_DEBIT_CALLBACK_URL", "https://frangipanigroup.com.ng/autopay/direct-debit-callback");
-
-    let data: any;
-    try {
-      const res = await axios.post(
-        "https://api.paystack.co/customer/authorization/initialize",
-        {
-          email:        user.email,
-          channel:      "direct_debit",
-          callback_url: appCallbackUrl,
-          account: {
-            number:    account.accountNumber,
-            bank_code: account.bankCode,
-          },
-        },
-        { headers: { Authorization: `Bearer ${paystackSecret}` } },
-      );
-      data = res.data.data;
-    } catch (err: any) {
-      const message = err.response?.data?.message ?? "Could not start direct debit authorization";
-      throw new BadRequestException(message);
-    }
-
-    await this.prisma.linkedBankAccount.update({
-      where: { id: accountId },
-      data:  { mandateReference: data.reference, mandateStatus: "pending" },
-    });
-
-    await this.prisma.auditLog.create({
-      data: { userId, action: "DIRECT_DEBIT_INITIALIZE", entity: "LinkedBankAccount", entityId: accountId },
-    });
-
-    return { redirectUrl: data.redirect_url, reference: data.reference };
-  }
-
-  // Step 2: poll this after the customer returns from the bank consent flow
-  // (or rely on the direct_debit.authorization.* webhooks — see webhook.controller.ts).
-  async checkDirectDebitStatus(userId: string, accountId: string) {
-    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId, deletedAt: null } });
-    if (!account) throw new NotFoundException("Linked account not found");
-    if (!account.mandateReference) {
-      return { mandateStatus: account.mandateStatus, active: false };
-    }
-    // If a webhook already marked this active, no need to call Paystack again
-    if (account.mandateStatus === "active") {
-      return { mandateStatus: "active", active: true };
-    }
-
-    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
-    try {
-      const { data } = await axios.get(
-        `https://api.paystack.co/customer/authorization/verify/${account.mandateReference}`,
-        { headers: { Authorization: `Bearer ${paystackSecret}` } },
-      );
-      const isActive = data.data.active === true;
-      await this.prisma.linkedBankAccount.update({
-        where: { id: accountId },
-        data: {
-          mandateStatus:    isActive ? "active" : "created",
-          paystackAuthCode: data.data.authorization_code ?? account.paystackAuthCode,
-        },
-      });
-      return { mandateStatus: isActive ? "active" : "created", active: isActive };
-    } catch (err: any) {
-      if (err.response?.status === 404) {
-        // Not yet approved by the customer
-        return { mandateStatus: "pending", active: false };
-      }
-      throw new BadRequestException("Could not check authorization status. Please try again.");
-    }
-  }
-
   // ── Paystack customer creation (idempotent) ───────────────────────────────
   async ensurePaystackCustomer(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (user.paystackCustomerCode) return { customerCode: user.paystackCustomerCode };
 
-    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
     const { data } = await axios.post(
       "https://api.paystack.co/customer",
-      { email: user.email, first_name: user.name.split(" ")[0], last_name: user.name.split(" ").slice(1).join(" ") || "—", phone: user.phone },
-      { headers: { Authorization: `Bearer ${paystackSecret}` } },
+      {
+        email:      user.email,
+        first_name: user.name.split(" ")[0],
+        last_name:  user.name.split(" ").slice(1).join(" ") || "—",
+        phone:      user.phone,
+      },
+      { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
     );
     await this.prisma.user.update({
       where: { id: userId },
-      data:  { paystackCustomerCode: data.data.customer_code, paystackCustomerId: String(data.data.id) },
+      data:  {
+        paystackCustomerCode: data.data.customer_code,
+        paystackCustomerId:   String(data.data.id),
+      },
     });
     return { customerCode: data.data.customer_code };
   }

@@ -8,16 +8,22 @@ import axios                from "axios";
 import { v4 as uuid }       from "uuid";
 import { PrismaService }    from "../common/prisma/prisma.service";
 import { SchedulesService } from "../schedules/schedules.service";
+import { UsersService }     from "../users/users.service";
 import { BulkPayDto }       from "./dto/payments.dto";
+
+// ── Platform fee ──────────────────────────────────────────────────────────────
+const PLATFORM_FEE_RATE = 0.001;           // 0.1%
+const MIN_FEE_KOBO      = 100;             // ₦1 minimum fee in kobo (avoid charging tiny amounts)
 
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
 
   constructor(
-    private readonly prisma:     PrismaService,
-    private readonly config:     ConfigService,
-    private readonly schedules:  SchedulesService,
+    private readonly prisma:    PrismaService,
+    private readonly config:    ConfigService,
+    private readonly schedules: SchedulesService,
+    private readonly users:     UsersService,
     @InjectQueue("payments") private readonly queue: Queue,
   ) {}
 
@@ -31,28 +37,14 @@ export class PaymentsService {
     });
     if (!sch || sch.status !== "active") return;
 
-    // Direct debit must be an active mandate before we can charge the user.
-    // Without this check we'd otherwise silently pay beneficiaries out of the
-    // platform's own balance instead of the customer's account.
-    if (!sch.sourceAccount?.paystackAuthCode || sch.sourceAccount.mandateStatus !== "active") {
-      this.logger.error(`Schedule ${scheduleId} has no active direct debit mandate — cannot charge user`);
-      await this.prisma.alert.create({
-        data: {
-          userId:     sch.userId,
-          type:       "danger",
-          title:      "⚠️ Action Needed: Authorise Direct Debit",
-          message:    `We couldn't process your ₦${Number(sch.amount).toLocaleString()} payment to ${sch.beneficiary.name} because your linked account isn't authorised for direct debit yet. Please complete bank authorisation.`,
-          scheduleId: sch.id,
-        },
-      });
-      throw new Error("Source account has no active direct debit mandate");
-    }
-
     const internalRef = `AUTOPAY-TXN-${uuid().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
 
-    // Create transaction record in "processing" state — this represents the
-    // debit-the-user leg. The pay-the-beneficiary leg (transfer) is only
-    // initiated once we receive a charge.success webhook for this reference.
+    // ── Calculate 0.1% platform fee ────────────────────────────────────────
+    const paymentAmount = Number(sch.amount);                          // in naira
+    const feeNaira      = Math.max(paymentAmount * PLATFORM_FEE_RATE, 1); // min ₦1
+    const feeKobo       = Math.round(feeNaira * 100);
+
+    // ── Create transaction record in "processing" state ────────────────────
     const txn = await this.prisma.transaction.create({
       data: {
         userId:          sch.userId,
@@ -60,24 +52,52 @@ export class PaymentsService {
         beneficiaryId:   sch.beneficiaryId,
         sourceAccountId: sch.sourceAccountId,
         amount:          sch.amount,
+        feeAmount:       feeNaira,           // recorded on the txn
         currency:        sch.currency,
         type:            sch.type,
         internalRef,
-        chargeReference: internalRef,
         status:          "processing",
         description:     sch.note ?? `AutoPay: ${sch.type}`,
       },
     });
 
+    // ── Step 1: Charge the 0.1% platform fee via stored card ──────────────
+    if (feeKobo >= MIN_FEE_KOBO && sch.user.cardAuthCode && sch.user.cardEmail) {
+      await this.chargePlatformFee({
+        txnId:       txn.id,
+        userId:      sch.userId,
+        authCode:    sch.user.cardAuthCode,
+        email:       sch.user.cardEmail,
+        feeKobo,
+        feeNaira,
+        internalRef,
+      });
+    } else if (!sch.user.cardAuthCode) {
+      this.logger.warn(
+        `No card auth for user ${sch.userId} — fee skipped for txn ${internalRef}. ` +
+        `User should re-link bank account to store card.`
+      );
+      await this.prisma.transaction.update({
+        where: { id: txn.id },
+        data:  { feeStatus: "skipped" },
+      });
+    }
+
+    // ── Step 2: Execute the main payment transfer ──────────────────────────
     try {
+      let recipientCode = sch.beneficiary.paystackRecipientCode;
+      if (!recipientCode) {
+        recipientCode = await this.ensureRecipientCode(sch.beneficiary);
+      }
+
       const { data } = await axios.post(
-        "https://api.paystack.co/transaction/charge_authorization",
+        "https://api.paystack.co/transfer",
         {
-          authorization_code: sch.sourceAccount.paystackAuthCode,
-          email:               sch.user.email,
-          amount:              Number(sch.amount) * 100, // Paystack expects kobo
-          currency:            sch.currency,
-          reference:           internalRef,
+          source:    "balance",
+          amount:    paymentAmount * 100,              // kobo
+          recipient: recipientCode,
+          reason:    sch.note || `AutoPay ${sch.type}`,
+          reference: internalRef,
         },
         { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
       );
@@ -85,26 +105,28 @@ export class PaymentsService {
       await this.prisma.transaction.update({
         where: { id: txn.id },
         data:  {
-          paystackStatus: data.data.status, // typically "processing" or "success"
-          processedAt:    new Date(),
+          status:             "pending",
+          paystackReference:  data.data.reference,
+          paystackTransferId: String(data.data.id),
+          paystackStatus:     data.data.status,
+          processedAt:        new Date(),
         },
       });
 
-      this.logger.log(`Charge initiated: ${internalRef} (status: ${data.data.status})`);
+      this.logger.log(`Transfer initiated: ${internalRef} → ${data.data.transfer_code} | fee: ₦${feeNaira.toFixed(2)}`);
+
     } catch (err: any) {
-      const message = err.response?.data?.message ?? err.message;
-      this.logger.error(`Charge failed for schedule ${scheduleId}: ${message}`);
+      this.logger.error(`Payment failed for schedule ${scheduleId}: ${err.message}`);
       await this.prisma.transaction.update({
         where: { id: txn.id },
-        data:  { status: "failed", failureReason: message },
+        data:  { status: "failed", failureReason: err.response?.data?.message ?? err.message },
       });
-
       await this.prisma.alert.create({
         data: {
           userId:     sch.userId,
           type:       "danger",
           title:      "❌ Payment Failed",
-          message:    `₦${Number(sch.amount).toLocaleString()} to ${sch.beneficiary.name} failed: ${message}`,
+          message:    `₦${paymentAmount.toLocaleString()} to ${sch.beneficiary.name} failed: ${err.response?.data?.message ?? "Unknown error"}`,
           scheduleId: sch.id,
           txnId:      txn.id,
         },
@@ -112,9 +134,60 @@ export class PaymentsService {
       throw err;   // BullMQ will retry
     }
 
-    // Advance schedule to next run date — note this reflects the charge being
-    // *initiated*, not yet settled. Settlement happens asynchronously via webhook.
     await this.advanceSchedule(sch);
+  }
+
+  // ── Charge the 0.1% platform fee against the user's stored card ───────────
+  private async chargePlatformFee(params: {
+    txnId:      string;
+    userId:     string;
+    authCode:   string;
+    email:      string;
+    feeKobo:    number;
+    feeNaira:   number;
+    internalRef: string;
+  }) {
+    const { txnId, userId, authCode, email, feeKobo, feeNaira, internalRef } = params;
+    const feeRef = `AUTOPAY-FEE-${internalRef.slice(-12)}`;
+
+    try {
+      const { data } = await axios.post(
+        "https://api.paystack.co/charge/authorize",
+        {
+          authorization_code: authCode,
+          email,
+          amount:             feeKobo,
+          reference:          feeRef,
+          metadata: {
+            autopay_action:   "PLATFORM_FEE",
+            autopay_user_id:  userId,
+            autopay_txn_ref:  internalRef,
+          },
+        },
+        { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
+      );
+
+      const status = data.data.status;
+
+      await this.prisma.transaction.update({
+        where: { id: txnId },
+        data:  {
+          feeRef,
+          feeStatus: status === "success" ? "success" : "pending",
+        },
+      });
+
+      this.logger.log(`Platform fee charged: ₦${feeNaira.toFixed(2)} | ref: ${feeRef} | status: ${status}`);
+
+    } catch (err: any) {
+      // Fee charge failure is non-fatal — we log it and continue with the
+      // main payment. A retry or manual review can handle failed fees.
+      this.logger.warn(`Platform fee charge failed for ${internalRef}: ${err.message}`);
+      await this.prisma.transaction.update({
+        where: { id: txnId },
+        data:  { feeRef, feeStatus: "failed" },
+      });
+    }
   }
 
   private async advanceSchedule(sch: any) {
@@ -173,16 +246,9 @@ export class PaymentsService {
     const total    = dto.payments.reduce((s, p) => s + p.amount, 0);
 
     const batch = await this.prisma.bulkBatch.create({
-      data: {
-        userId,
-        batchRef,
-        totalAmount: total,
-        count:       dto.payments.length,
-        status:      "pending",
-      },
+      data: { userId, batchRef, totalAmount: total, count: dto.payments.length, status: "pending" },
     });
 
-    // Enqueue each payment as an individual BullMQ job
     for (const p of dto.payments) {
       const bene = await this.prisma.beneficiary.findFirst({ where: { id: p.beneficiaryId, userId } });
       if (!bene) continue;
@@ -213,9 +279,8 @@ export class PaymentsService {
     return { batch, message: `${dto.payments.length} payments queued` };
   }
 
-  // ── Webhook handler (called by WebhookController) ─────────────────────────
+  // ── Webhook handler ───────────────────────────────────────────────────────
   async handlePaystackWebhook(event: string, data: any) {
-    // Idempotency check
     const eventId = data.id?.toString() ?? `${event}:${data.reference}`;
     const existing = await this.prisma.webhookEvent.findUnique({ where: { eventId } });
     if (existing?.processedAt) return { skipped: true };
@@ -226,39 +291,55 @@ export class PaymentsService {
       create: { provider: "paystack", eventId, event, payload: data },
     });
 
-    // ── Direct debit mandate lifecycle ───────────────────────────────────────
-    if (event === "direct_debit.authorization.created" || event === "direct_debit.authorization.active") {
-      await this.handleDirectDebitAuthorizationEvent(event, data);
-    }
-
-    // ── Leg 1: charging the user's linked account ────────────────────────────
+    // ── Handle ₦50 linking fee card charge ────────────────────────────────
     if (event === "charge.success") {
-      await this.handleChargeSuccess(data);
-    }
-    if (event === "charge.failed") {
-      await this.handleChargeFailed(data);
+      const meta = data.metadata ?? {};
+
+      if (meta.autopay_action === "LINK_BANK") {
+        // This is the ₦50 linking fee — complete the bank account linking
+        await this.users.completeLinkAfterFee({
+          reference:    data.reference,
+          authCode:     data.authorization?.authorization_code,
+          cardEmail:    data.customer?.email,
+          cardLast4:    data.authorization?.last4,
+          cardBin:      data.authorization?.bin,
+          cardExpMonth: data.authorization?.exp_month,
+          cardExpYear:  data.authorization?.exp_year,
+          userId:       meta.autopay_user_id,
+          accountNumber: meta.account_number,
+          bankCode:      meta.bank_code,
+          bankName:      meta.bank_name,
+          accountName:   meta.account_name,
+        });
+        this.logger.log(`Bank linking fee paid and account linked for user ${meta.autopay_user_id}`);
+      }
+
+      if (meta.autopay_action === "PLATFORM_FEE") {
+        // Update the fee status on the transaction
+        await this.prisma.transaction.updateMany({
+          where: { feeRef: data.reference },
+          data:  { feeStatus: "success" },
+        });
+        this.logger.log(`Platform fee confirmed: ${data.reference}`);
+      }
     }
 
-    // ── Leg 2: paying the beneficiary out (after a successful charge) ───────
+    // ── Handle transfer outcomes ──────────────────────────────────────────
     if (event === "transfer.success") {
       await this.prisma.transaction.updateMany({
         where: { paystackReference: data.reference },
-        data:  {
-          status:       "success",
-          paystackStatus: "success",
-          paystackData:  data,
-          settledAt:    new Date(),
-        },
+        data:  { status: "success", paystackStatus: "success", paystackData: data, settledAt: new Date() },
       });
       const txn = await this.prisma.transaction.findFirst({ where: { paystackReference: data.reference } });
       if (txn) {
         const bene = await this.prisma.beneficiary.findUnique({ where: { id: txn.beneficiaryId! } });
+        const fee  = txn.feeAmount ? ` (incl. ₦${Number(txn.feeAmount).toFixed(2)} service fee)` : "";
         await this.prisma.alert.create({
           data: {
             userId:  txn.userId,
             type:    "info",
             title:   "✅ Payment Successful",
-            message: `₦${Number(txn.amount).toLocaleString()} to ${bene?.name} completed. Ref: ${txn.internalRef}`,
+            message: `₦${Number(txn.amount).toLocaleString()} to ${bene?.name} completed${fee}. Ref: ${txn.internalRef}`,
             txnId:   txn.id,
           },
         });
@@ -266,163 +347,15 @@ export class PaymentsService {
     }
 
     if (event === "transfer.failed" || event === "transfer.reversed") {
-      const txn = await this.prisma.transaction.findFirst({ where: { paystackReference: data.reference } });
       await this.prisma.transaction.updateMany({
         where: { paystackReference: data.reference },
         data:  { status: "failed", paystackStatus: event.split(".")[1], paystackData: data },
       });
-      if (txn) {
-        // We already collected the money from the user (charge.success fired
-        // earlier) but couldn't pay the beneficiary — this needs manual
-        // follow-up (refund or retry), not just a silent status flip.
-        const bene = await this.prisma.beneficiary.findUnique({ where: { id: txn.beneficiaryId! } });
-        await this.prisma.alert.create({
-          data: {
-            userId:  txn.userId,
-            type:    "danger",
-            title:   "⚠️ Payout Failed After Charge",
-            message: `We collected ₦${Number(txn.amount).toLocaleString()} from your account but the payout to ${bene?.name} failed. Our team has been notified — Ref: ${txn.internalRef}`,
-            txnId:   txn.id,
-          },
-        });
-        this.logger.error(`Transfer failed AFTER successful charge for txn ${txn.id} (ref: ${txn.internalRef}) — needs manual refund/retry review`);
-      }
     }
 
     await this.prisma.webhookEvent.update({
       where: { eventId },
       data:  { processedAt: new Date() },
-    });
-  }
-
-  // Direct debit mandate created/activated — find the matching pending/created
-  // LinkedBankAccount for this customer and update its status.
-  private async handleDirectDebitAuthorizationEvent(event: string, data: any) {
-    const customerCode = data.customer?.code;
-    const customerEmail = data.customer?.email;
-    if (!customerCode && !customerEmail) return;
-
-    const user = await this.prisma.user.findFirst({
-      where: customerCode ? { paystackCustomerCode: customerCode } : { email: customerEmail },
-    });
-    if (!user) {
-      this.logger.warn(`Direct debit webhook (${event}) — no matching user for customer ${customerCode ?? customerEmail}`);
-      return;
-    }
-
-    // Best-effort match: the webhook payload doesn't echo back our original
-    // reference, so we match on the most recently initiated pending/created
-    // mandate for this user. If a user has multiple mandates in flight at the
-    // same time this could match the wrong one — acceptable for now since the
-    // UI only allows one in-progress authorization at a time.
-    const account = await this.prisma.linkedBankAccount.findFirst({
-      where: { userId: user.id, mandateStatus: { in: ["pending", "created"] }, deletedAt: null },
-      orderBy: { updatedAt: "desc" },
-    });
-    if (!account) {
-      this.logger.warn(`Direct debit webhook (${event}) — no pending mandate found for user ${user.id}`);
-      return;
-    }
-
-    const isActive = event === "direct_debit.authorization.active";
-    await this.prisma.linkedBankAccount.update({
-      where: { id: account.id },
-      data: {
-        mandateStatus:    isActive ? "active" : "created",
-        paystackAuthCode: data.authorization_code ?? account.paystackAuthCode,
-      },
-    });
-
-    await this.prisma.alert.create({
-      data: {
-        userId:  user.id,
-        type:    isActive ? "info" : "warn",
-        title:   isActive ? "✅ Direct Debit Authorised" : "🔄 Bank Authorisation Received",
-        message: isActive
-          ? `Your ${account.bankName} account is now authorised for AutoPay. Scheduled payments can debit this account.`
-          : `We received your bank's confirmation. Activation can take up to 24 hours — we'll notify you once it's ready.`,
-      },
-    });
-  }
-
-  // The user's account was successfully charged for a scheduled payment.
-  // Now (and only now) initiate the actual payout to the beneficiary.
-  private async handleChargeSuccess(data: any) {
-    const txn = await this.prisma.transaction.findFirst({ where: { chargeReference: data.reference } });
-    if (!txn || txn.status !== "processing") return; // not one of ours, or already handled
-
-    const beneficiary = await this.prisma.beneficiary.findUnique({ where: { id: txn.beneficiaryId! } });
-    if (!beneficiary) {
-      this.logger.error(`charge.success for txn ${txn.id} but beneficiary ${txn.beneficiaryId} not found`);
-      return;
-    }
-
-    try {
-      let recipientCode = beneficiary.paystackRecipientCode;
-      if (!recipientCode) {
-        recipientCode = await this.ensureRecipientCode(beneficiary);
-      }
-
-      const transferRef = `${txn.internalRef}-OUT`;
-      const { data: transfer } = await axios.post(
-        "https://api.paystack.co/transfer",
-        {
-          source:    "balance",
-          amount:    Number(txn.amount) * 100,
-          recipient: recipientCode,
-          reason:    txn.description || "AutoPay payout",
-          reference: transferRef,
-        },
-        { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
-      );
-
-      await this.prisma.transaction.update({
-        where: { id: txn.id },
-        data: {
-          status:             "pending", // charged ✅, payout in flight — settles on transfer.success
-          paystackReference:  transfer.data.reference,
-          paystackTransferId: String(transfer.data.id),
-          paystackStatus:     transfer.data.status,
-        },
-      });
-    } catch (err: any) {
-      const message = err.response?.data?.message ?? err.message;
-      this.logger.error(`Payout-after-charge failed for txn ${txn.id}: ${message}`);
-      await this.prisma.transaction.update({
-        where: { id: txn.id },
-        data:  { status: "failed", failureReason: `Charged but payout failed: ${message}` },
-      });
-      await this.prisma.alert.create({
-        data: {
-          userId:  txn.userId,
-          type:    "danger",
-          title:   "⚠️ Payout Failed After Charge",
-          message: `We collected ₦${Number(txn.amount).toLocaleString()} from your account but couldn't pay ${beneficiary.name}: ${message}. Our team has been notified.`,
-          txnId:   txn.id,
-        },
-      });
-    }
-  }
-
-  private async handleChargeFailed(data: any) {
-    const txn = await this.prisma.transaction.findFirst({ where: { chargeReference: data.reference } });
-    if (!txn || txn.status !== "processing") return;
-
-    const message = data.gateway_response ?? "Charge failed";
-    await this.prisma.transaction.update({
-      where: { id: txn.id },
-      data:  { status: "failed", failureReason: message, paystackStatus: "failed", paystackData: data },
-    });
-
-    const bene = txn.beneficiaryId ? await this.prisma.beneficiary.findUnique({ where: { id: txn.beneficiaryId } }) : null;
-    await this.prisma.alert.create({
-      data: {
-        userId:  txn.userId,
-        type:    "danger",
-        title:   "❌ Payment Failed",
-        message: `₦${Number(txn.amount).toLocaleString()}${bene ? ` to ${bene.name}` : ""} failed: ${message}`,
-        txnId:   txn.id,
-      },
     });
   }
 
