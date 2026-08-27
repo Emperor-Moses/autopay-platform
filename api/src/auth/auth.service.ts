@@ -55,7 +55,7 @@ export class AuthService {
     });
 
     const tokens = await this.issueTokens(user.id);
-    return { user, ...tokens };
+    return { user: { ...user, hasPin: false }, ...tokens };
   }
 
   // ── Login ──────────────────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ export class AuthService {
 
     const tokens = await this.issueTokens(user.id, ipAddress, dto.deviceInfo);
     const { passwordHash, pin, ...safeUser } = user;
-    return { user: safeUser, ...tokens };
+    return { user: { ...safeUser, hasPin: !!pin }, ...tokens };
   }
 
   // ── Refresh token ──────────────────────────────────────────────────────────

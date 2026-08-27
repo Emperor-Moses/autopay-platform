@@ -11,4 +11,9 @@ export const UsersAPI = {
   linkBank: (payload) => api.post("/users/me/bank-accounts", payload).then((r) => r.data),
   setDefaultBank: (id) => api.patch(`/users/me/bank-accounts/${id}/default`).then((r) => r.data),
   unlinkBank: (id) => api.delete(`/users/me/bank-accounts/${id}`).then((r) => r.data),
+
+  initializeDirectDebit: (accountId) =>
+    api.post(`/users/me/bank-accounts/${accountId}/direct-debit/initialize`).then((r) => r.data),
+  getDirectDebitStatus: (accountId) =>
+    api.get(`/users/me/bank-accounts/${accountId}/direct-debit/status`).then((r) => r.data),
 };

@@ -1,5 +1,5 @@
 import {
-  Injectable, NotFoundException, ConflictException, BadRequestException,
+  Injectable, NotFoundException, ConflictException, BadRequestException, Logger,
 } from "@nestjs/common";
 import * as bcrypt          from "bcrypt";
 import { PrismaService }   from "../common/prisma/prisma.service";
@@ -11,6 +11,8 @@ import { ConfigService }    from "@nestjs/config";
 
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     private readonly prisma:  PrismaService,
     private readonly config:  ConfigService,
@@ -24,12 +26,14 @@ export class UsersService {
         id: true, name: true, email: true, phone: true, avatarUrl: true,
         plan: true, planExpiresAt: true, betaAccess: true,
         settings: true, createdAt: true, lastLoginAt: true,
+        pin: true,
         _count: {
           select: { beneficiaries: true, schedules: true, transactions: true },
         },
       },
     });
-    return user;
+    const { pin, ...safeUser } = user;
+    return { ...safeUser, hasPin: !!pin };
   }
 
   async updateProfile(userId: string, dto: UpdateProfileDto) {
@@ -119,9 +123,13 @@ export class UsersService {
         accountNumber: dto.accountNumber,
         accountName,
         isDefault:   count === 0,
+        // isVerified here means "Paystack confirmed this account number+bank code
+        // resolves to a real account name" — NOT that direct debit is authorised.
+        // That only happens once mandateStatus reaches "active" below.
         isVerified:  true,
         verifiedAt:  new Date(),
         paystackChannelType: "bank_account",
+        mandateStatus: "none",
       },
     });
 
@@ -150,6 +158,23 @@ export class UsersService {
     });
     if (has) throw new BadRequestException("This account has active schedules. Cancel them first.");
 
+    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId } });
+    if (!account) throw new NotFoundException("Account not found");
+
+    // If a direct debit mandate is active, deactivate it on Paystack's side too
+    if (account.paystackAuthCode) {
+      try {
+        await axios.post(
+          "https://api.paystack.co/customer/authorization/deactivate",
+          { authorization_code: account.paystackAuthCode },
+          { headers: { Authorization: `Bearer ${this.config.get("PAYSTACK_SECRET_KEY")}` } },
+        );
+      } catch {
+        // Non-fatal — log and continue unlinking locally even if Paystack call fails
+        this.logger.warn(`Could not deactivate Paystack authorization for account ${accountId}`);
+      }
+    }
+
     await this.prisma.linkedBankAccount.update({
       where: { id: accountId },
       data:  { deletedAt: new Date() },
@@ -158,6 +183,91 @@ export class UsersService {
       data: { userId, action: "UNLINK_BANK", entity: "LinkedBankAccount", entityId: accountId },
     });
     return { message: "Account unlinked" };
+  }
+
+  // ── Direct Debit mandate ──────────────────────────────────────────────────
+  // Step 1: kick off the mandate authorization request. Returns a redirect_url
+  // that the mobile app must open (in-app browser / WebView) so the customer
+  // can give consent on their bank's flow.
+  async initializeDirectDebit(userId: string, accountId: string) {
+    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId, deletedAt: null } });
+    if (!account) throw new NotFoundException("Linked account not found");
+    if (account.mandateStatus === "active") {
+      throw new BadRequestException("This account is already authorised for direct debit");
+    }
+
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
+    const appCallbackUrl = this.config.get("DIRECT_DEBIT_CALLBACK_URL", "https://frangipanigroup.com.ng/autopay/direct-debit-callback");
+
+    let data: any;
+    try {
+      const res = await axios.post(
+        "https://api.paystack.co/customer/authorization/initialize",
+        {
+          email:        user.email,
+          channel:      "direct_debit",
+          callback_url: appCallbackUrl,
+          account: {
+            number:    account.accountNumber,
+            bank_code: account.bankCode,
+          },
+        },
+        { headers: { Authorization: `Bearer ${paystackSecret}` } },
+      );
+      data = res.data.data;
+    } catch (err: any) {
+      const message = err.response?.data?.message ?? "Could not start direct debit authorization";
+      throw new BadRequestException(message);
+    }
+
+    await this.prisma.linkedBankAccount.update({
+      where: { id: accountId },
+      data:  { mandateReference: data.reference, mandateStatus: "pending" },
+    });
+
+    await this.prisma.auditLog.create({
+      data: { userId, action: "DIRECT_DEBIT_INITIALIZE", entity: "LinkedBankAccount", entityId: accountId },
+    });
+
+    return { redirectUrl: data.redirect_url, reference: data.reference };
+  }
+
+  // Step 2: poll this after the customer returns from the bank consent flow
+  // (or rely on the direct_debit.authorization.* webhooks — see webhook.controller.ts).
+  async checkDirectDebitStatus(userId: string, accountId: string) {
+    const account = await this.prisma.linkedBankAccount.findFirst({ where: { id: accountId, userId, deletedAt: null } });
+    if (!account) throw new NotFoundException("Linked account not found");
+    if (!account.mandateReference) {
+      return { mandateStatus: account.mandateStatus, active: false };
+    }
+    // If a webhook already marked this active, no need to call Paystack again
+    if (account.mandateStatus === "active") {
+      return { mandateStatus: "active", active: true };
+    }
+
+    const paystackSecret = this.config.get("PAYSTACK_SECRET_KEY");
+    try {
+      const { data } = await axios.get(
+        `https://api.paystack.co/customer/authorization/verify/${account.mandateReference}`,
+        { headers: { Authorization: `Bearer ${paystackSecret}` } },
+      );
+      const isActive = data.data.active === true;
+      await this.prisma.linkedBankAccount.update({
+        where: { id: accountId },
+        data: {
+          mandateStatus:    isActive ? "active" : "created",
+          paystackAuthCode: data.data.authorization_code ?? account.paystackAuthCode,
+        },
+      });
+      return { mandateStatus: isActive ? "active" : "created", active: isActive };
+    } catch (err: any) {
+      if (err.response?.status === 404) {
+        // Not yet approved by the customer
+        return { mandateStatus: "pending", active: false };
+      }
+      throw new BadRequestException("Could not check authorization status. Please try again.");
+    }
   }
 
   // ── Paystack customer creation (idempotent) ───────────────────────────────

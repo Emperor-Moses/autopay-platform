@@ -62,6 +62,17 @@ export class UsersController {
     return this.users.unlinkBankAccount(req.user.id, id);
   }
 
+  // ── Direct Debit mandate ─────────────────────────────────────────────────
+  @Post("me/bank-accounts/:id/direct-debit/initialize")
+  initializeDirectDebit(@Req() req: any, @Param("id") id: string) {
+    return this.users.initializeDirectDebit(req.user.id, id);
+  }
+
+  @Get("me/bank-accounts/:id/direct-debit/status")
+  getDirectDebitStatus(@Req() req: any, @Param("id") id: string) {
+    return this.users.checkDirectDebitStatus(req.user.id, id);
+  }
+
   // ── Paystack customer ─────────────────────────────────────────────────────
   @Post("me/paystack-customer")
   ensureCustomer(@Req() req: any) {

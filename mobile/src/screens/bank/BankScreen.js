@@ -1,6 +1,7 @@
 import React, { useState } from "react";
-import { View, Text, FlatList, StyleSheet, TouchableOpacity } from "react-native";
+import { View, Text, FlatList, StyleSheet, TouchableOpacity, ActivityIndicator } from "react-native";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import * as WebBrowser from "expo-web-browser";
 import { COLORS, bankColor, bankInitials } from "../../theme";
 import { UsersAPI } from "../../api/users";
 import { fetchBanks } from "../../api/resources";
@@ -11,12 +12,20 @@ import FormField from "../../components/FormField";
 import Button from "../../components/Button";
 import Badge from "../../components/Badge";
 
+const MANDATE_LABEL = {
+  none:    { label: "Not Authorised", tone: "warn" },
+  pending: { label: "Pending — Check Status", tone: "warn" },
+  created: { label: "Activating…", tone: "warn" },
+  active:  { label: "Direct Debit Active", tone: "neutral" },
+};
+
 export default function BankScreen({ navigation }) {
   const { showToast } = useToast();
   const queryClient = useQueryClient();
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(""); 
   const [selectedBank, setSelectedBank] = useState(null);
   const [acctNum, setAcctNum] = useState("");
+  const [checkingId, setCheckingId] = useState(null);
 
   const accountsQ = useQuery({ queryKey: ["bankAccounts"], queryFn: UsersAPI.bankAccounts });
   const banksQ = useQuery({ queryKey: ["banks"], queryFn: fetchBanks, staleTime: Infinity });
@@ -30,6 +39,41 @@ export default function BankScreen({ navigation }) {
     },
     onError: (e) => showToast(apiErrorMessage(e, "Could not verify account"), "error"),
   });
+
+  const authoriseMut = useMutation({
+    mutationFn: (accountId) => UsersAPI.initializeDirectDebit(accountId),
+    onError: (e) => showToast(apiErrorMessage(e, "Could not start authorisation"), "error"),
+  });
+
+  async function handleAuthorise(account) {
+    try {
+      const { redirectUrl } = await authoriseMut.mutateAsync(account.id);
+      await WebBrowser.openAuthSessionAsync(redirectUrl);
+      // The user has returned from their bank's consent flow — check status now.
+      await handleCheckStatus(account, true);
+    } catch (e) {
+      showToast(apiErrorMessage(e, "Could not start authorisation"), "error");
+    }
+  }
+
+  async function handleCheckStatus(account, silent = false) {
+    setCheckingId(account.id);
+    try {
+      const result = await UsersAPI.getDirectDebitStatus(account.id);
+      queryClient.invalidateQueries({ queryKey: ["bankAccounts"] });
+      if (!silent) {
+        showToast(
+          result.active
+            ? "✅ Direct debit is active for this account"
+            : "Still pending — this can take up to 24 hours after your bank confirms",
+        );
+      }
+    } catch (e) {
+      if (!silent) showToast(apiErrorMessage(e, "Could not check status"), "error");
+    } finally {
+      setCheckingId(null);
+    }
+  }
 
   const banks = banksQ.data || [];
   const filtered = search ? banks.filter((b) => b.name.toLowerCase().includes(search.toLowerCase())) : banks;
@@ -57,20 +101,54 @@ export default function BankScreen({ navigation }) {
               </Text>
             </View>
 
-            {(accountsQ.data || []).map((acc) => (
-              <View key={acc.id} style={styles.linkedCard}>
-                <View style={[styles.avatar, { backgroundColor: bankColor(acc.bankName) }]}>
-                  <Text style={styles.avatarText}>{bankInitials(acc.bankName)}</Text>
+            {(accountsQ.data || []).map((acc) => {
+              const mandate = MANDATE_LABEL[acc.mandateStatus] || MANDATE_LABEL.none;
+              const isActive = acc.mandateStatus === "active";
+              return (
+                <View key={acc.id} style={styles.linkedCard}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+                    <View style={[styles.avatar, { backgroundColor: bankColor(acc.bankName) }]}>
+                      <Text style={styles.avatarText}>{bankInitials(acc.bankName)}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.linkedBankName}>{acc.bankName}</Text>
+                      <Text style={styles.linkedSub}>
+                        ···{acc.accountNumber?.slice(-4)} · {acc.accountName}
+                      </Text>
+                    </View>
+                    {acc.isDefault && <Badge label="DEFAULT" tone="neutral" />}
+                  </View>
+
+                  <View style={styles.mandateRow}>
+                    <Badge label={mandate.label} tone={mandate.tone} />
+                    {!isActive && (
+                      <TouchableOpacity
+                        onPress={() =>
+                          acc.mandateStatus === "none"
+                            ? handleAuthorise(acc)
+                            : handleCheckStatus(acc)
+                        }
+                        disabled={authoriseMut.isPending || checkingId === acc.id}
+                        style={styles.mandateAction}
+                      >
+                        {checkingId === acc.id || (authoriseMut.isPending && authoriseMut.variables === acc.id) ? (
+                          <ActivityIndicator size="small" color={COLORS.green} />
+                        ) : (
+                          <Text style={styles.mandateActionText}>
+                            {acc.mandateStatus === "none" ? "Authorise →" : "Check Status"}
+                          </Text>
+                        )}
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                  {!isActive && (
+                    <Text style={styles.mandateHint}>
+                      AutoPay needs your bank's permission before it can debit this account for scheduled payments.
+                    </Text>
+                  )}
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.linkedBankName}>{acc.bankName}</Text>
-                  <Text style={styles.linkedSub}>
-                    ···{acc.accountNumber?.slice(-4)} · {acc.accountName}
-                  </Text>
-                </View>
-                {acc.isDefault && <Badge label="DEFAULT" tone="neutral" />}
-              </View>
-            ))}
+              );
+            })}
 
             <FormField
               label="Search Bank"
@@ -124,8 +202,12 @@ const styles = StyleSheet.create({
   secureText: { fontSize: 12, color: COLORS.green, lineHeight: 18 },
   linkedCard: {
     backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.border, borderRadius: 14,
-    padding: 13, flexDirection: "row", alignItems: "center", gap: 12,
+    padding: 13, gap: 10,
   },
+  mandateRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  mandateAction: { paddingVertical: 4, paddingHorizontal: 10 },
+  mandateActionText: { fontSize: 12, fontWeight: "700", color: COLORS.green },
+  mandateHint: { fontSize: 11, color: COLORS.muted2, lineHeight: 16 },
   avatar: { width: 40, height: 40, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   avatarText: { fontSize: 12, fontWeight: "700", color: "#fff" },
   linkedBankName: { fontSize: 14, fontWeight: "600", color: COLORS.text },

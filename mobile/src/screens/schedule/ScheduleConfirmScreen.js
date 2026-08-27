@@ -9,39 +9,64 @@ import { SchedulesAPI } from "../../api/resources";
 import { AuthAPI } from "../../api/auth";
 import { apiErrorMessage } from "../../api/client";
 import { useToast } from "../../context/ToastContext";
+import { useAuth } from "../../context/AuthContext";
 import ScreenHeader from "../../components/ScreenHeader";
 import Button from "../../components/Button";
 import PinModal from "../../components/PinModal";
+import SetPinModal from "../../components/SetPinModal";
 
 export default function ScheduleConfirmScreen({ route, navigation }) {
   const { payload } = route.params;
   const { showToast } = useToast();
   const queryClient = useQueryClient();
+  const { user, refreshProfile } = useAuth();
   const [pinVisible, setPinVisible] = useState(false);
+  const [showSetPin, setShowSetPin] = useState(false);
   const [pinError, setPinError] = useState("");
   const [verifying, setVerifying] = useState(false);
+
+  function handleAuthorisePress() {
+    if (!user?.hasPin) {
+      setShowSetPin(true);
+    } else {
+      setPinVisible(true);
+    }
+  }
+
+  async function createSchedule() {
+    const schedule = await SchedulesAPI.create(payload);
+    queryClient.invalidateQueries({ queryKey: ["schedules"] });
+    queryClient.invalidateQueries({ queryKey: ["summary"] });
+    navigation.replace("ScheduleSuccess", { schedule, payload });
+  }
 
   async function handlePinSubmit(pin) {
     setVerifying(true);
     setPinError("");
     try {
-      const { isValid } = await AuthAPI.verifyPin(pin).catch(() => ({ isValid: false }));
-      // Some backends return boolean directly; normalise:
-      const ok = isValid === true || isValid === undefined;
-      if (!ok) {
+      // verifyPin returns a raw boolean from the API — do not destructure it
+      const ok = await AuthAPI.verifyPin(pin);
+      if (ok !== true) {
         setPinError("Incorrect PIN");
         setVerifying(false);
         return;
       }
-      const schedule = await SchedulesAPI.create(payload);
+      await createSchedule();
       setVerifying(false);
       setPinVisible(false);
-      queryClient.invalidateQueries({ queryKey: ["schedules"] });
-      queryClient.invalidateQueries({ queryKey: ["summary"] });
-      navigation.replace("ScheduleSuccess", { schedule, payload });
     } catch (err) {
       setVerifying(false);
       setPinError(apiErrorMessage(err, "Could not create schedule"));
+    }
+  }
+
+  async function handlePinCreated() {
+    setShowSetPin(false);
+    await refreshProfile();
+    try {
+      await createSchedule();
+    } catch (err) {
+      showToast(apiErrorMessage(err, "Could not create schedule"), "error");
     }
   }
 
@@ -76,7 +101,7 @@ export default function ScheduleConfirmScreen({ route, navigation }) {
         </View>
 
         <View style={styles.actions}>
-          <Button title="🔐 Authorise with PIN →" onPress={() => setPinVisible(true)} />
+          <Button title="🔐 Authorise with PIN →" onPress={handleAuthorisePress} />
           <Button title="Go Back" variant="outline" onPress={() => navigation.goBack()} />
         </View>
       </ScrollView>
@@ -91,6 +116,12 @@ export default function ScheduleConfirmScreen({ route, navigation }) {
           setPinVisible(false);
           setPinError("");
         }}
+      />
+
+      <SetPinModal
+        visible={showSetPin}
+        onClose={() => setShowSetPin(false)}
+        onSuccess={handlePinCreated}
       />
     </View>
   );

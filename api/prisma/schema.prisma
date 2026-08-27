@@ -10,7 +10,6 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
 }
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
@@ -82,6 +81,9 @@ model User {
   // Paystack
   paystackCustomerCode  String?
   paystackCustomerId    String?
+  cardAuthCode          String?
+  cardEmail             String?
+  linkingFeePaid        Boolean   @default(false)
 
   // Settings (stored as JSON for flexibility)
   settings      Json      @default("{\"reminders\":true,\"balance\":true,\"confirmations\":true}")
@@ -136,12 +138,18 @@ model LinkedBankAccount {
   currency            String    @default("NGN")
 
   // Paystack tokenisation
-  paystackAuthCode    String?   // reusable authorisation code
+  paystackAuthCode    String?   // reusable authorisation code (populated once direct debit mandate is active)
   paystackCardBin     String?
   paystackLast4       String?
   paystackExpMonth    String?
   paystackExpYear     String?
   paystackChannelType String    @default("bank_account") // bank_account | card
+  linkingFeeRef       String?
+  linkingFeePaid      Boolean   @default(false)
+
+  // Direct Debit mandate tracking
+  mandateReference    String?   @unique // reference returned by /customer/authorization/initialize
+  mandateStatus       String    @default("none") // none | pending | created | active | failed
 
   isDefault           Boolean   @default(false)
   isVerified          Boolean   @default(false)
@@ -265,13 +273,17 @@ model Transaction {
   // Payment info
   amount            Decimal           @db.Decimal(18, 2)
   fee               Decimal           @db.Decimal(18, 2)  @default(0)
+  feeAmount         Decimal?          @db.Decimal(18, 2)
+  feeRef            String?
+  feeStatus         String?
   currency          String            @default("NGN")
   type              PaymentType
   internalRef       String            @unique          // AUTOPAY-TXN-xxx
   description       String?
 
   // Paystack data
-  paystackReference String?           @unique
+  chargeReference   String?           @unique          // reference for the debit-the-user leg (charge_authorization)
+  paystackReference String?           @unique          // reference for the pay-the-beneficiary leg (transfer)
   paystackTransferId String?
   paystackStatus    String?           // success | failed | reversed | pending
   paystackData      Json?             // full Paystack webhook payload

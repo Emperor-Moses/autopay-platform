@@ -20,7 +20,7 @@ export class WebhookController {
 
   @Post("paystack")
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: "Receive Paystack webhook events (transfer.success / transfer.failed)" })
+  @ApiOperation({ summary: "Receive Paystack webhook events (charge.success/failed, transfer.success/failed, direct_debit.authorization.*)" })
   async handlePaystack(
     @Headers("x-paystack-signature") signature: string,
     @Req() req: RawBodyRequest<Request>,

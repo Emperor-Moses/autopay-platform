@@ -30,7 +30,9 @@ export default function ScheduleScreen({ navigation }) {
   const [errors, setErrors] = useState({});
 
   const beneficiary = beneQ.data?.find((b) => b.id === beneficiaryId);
-  const hasBank = (bankQ.data || []).length > 0;
+  const accounts = bankQ.data || [];
+  const hasBank = accounts.length > 0;
+  const hasActiveMandate = accounts.some((a) => a.mandateStatus === "active");
 
   function validateAndContinue() {
     const e = {};
@@ -38,6 +40,7 @@ export default function ScheduleScreen({ navigation }) {
     if (!amount || parseFloat(amount) < 100) e.amount = "Minimum ₦100";
     if (!date) e.date = "Select a date";
     if (!hasBank) e.bank = "Link a bank account first";
+    else if (!hasActiveMandate) e.bank = "Authorise direct debit on your bank account before scheduling";
     if (Object.keys(e).length) {
       setErrors(e);
       return;
