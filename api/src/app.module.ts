@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { PlansModule } from "./plans/plans.module";
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { ThrottlerModule } from "@nestjs/throttler";
 import { BullModule } from "@nestjs/bull";
@@ -54,6 +55,7 @@ import { JobsModule }          from "./jobs/jobs.module";
     PaymentsModule,
     AlertsModule,
     JobsModule,
+    PlansModule
   ],
 })
 export class AppModule {}

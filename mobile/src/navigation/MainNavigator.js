@@ -1,7 +1,7 @@
 import React from "react";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import TabNavigator from "./TabNavigator";
-
+import PricingScreen from "../screens/PricingScreen";
 import ScheduleScreen from "../screens/schedule/ScheduleScreen";
 import ScheduleConfirmScreen from "../screens/schedule/ScheduleConfirmScreen";
 import ScheduleSuccessScreen from "../screens/schedule/ScheduleSuccessScreen";
@@ -25,6 +25,7 @@ export default function MainNavigator() {
       <Stack.Screen name="Bank" component={BankScreen} />
       <Stack.Screen name="Bulk" component={BulkScreen} options={{ presentation: "modal" }} />
       <Stack.Screen name="Analytics" component={AnalyticsScreen} />
+      <Stack.Screen name="Pricing" component={PricingScreen} />
     </Stack.Navigator>
   );
 }

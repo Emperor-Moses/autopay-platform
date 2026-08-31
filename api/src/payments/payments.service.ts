@@ -1,3 +1,4 @@
+import { PlansService } from "../plans/plans.service";
 import {
   Injectable, NotFoundException, BadRequestException, Logger,
 } from "@nestjs/common";
@@ -24,6 +25,7 @@ export class PaymentsService {
     private readonly config:    ConfigService,
     private readonly schedules: SchedulesService,
     private readonly users:     UsersService,
+    private readonly plansService: PlansService,
     @InjectQueue("payments") private readonly queue: Queue,
   ) {}
 
@@ -292,37 +294,51 @@ export class PaymentsService {
     });
 
     // ── Handle ₦50 linking fee card charge ────────────────────────────────
-    if (event === "charge.success") {
-      const meta = data.metadata ?? {};
 
-      if (meta.autopay_action === "LINK_BANK") {
-        // This is the ₦50 linking fee — complete the bank account linking
-        await this.users.completeLinkAfterFee({
-          reference:    data.reference,
-          authCode:     data.authorization?.authorization_code,
-          cardEmail:    data.customer?.email,
-          cardLast4:    data.authorization?.last4,
-          cardBin:      data.authorization?.bin,
-          cardExpMonth: data.authorization?.exp_month,
-          cardExpYear:  data.authorization?.exp_year,
-          userId:       meta.autopay_user_id,
-          accountNumber: meta.account_number,
-          bankCode:      meta.bank_code,
-          bankName:      meta.bank_name,
-          accountName:   meta.account_name,
-        });
-        this.logger.log(`Bank linking fee paid and account linked for user ${meta.autopay_user_id}`);
-      }
+if (event === "charge.success") {
+  const meta = data.metadata ?? {};
+  const auth = data.authorization ?? {};
 
-      if (meta.autopay_action === "PLATFORM_FEE") {
-        // Update the fee status on the transaction
-        await this.prisma.transaction.updateMany({
-          where: { feeRef: data.reference },
-          data:  { feeStatus: "success" },
-        });
-        this.logger.log(`Platform fee confirmed: ${data.reference}`);
-      }
-    }
+  if (meta.autopay_action === "LINK_BANK") {
+    // ── Card paid ₦50 — complete linking using card data from Paystack ──
+    await this.users.completeLinkAfterFee({
+      reference:    data.reference,
+      authCode:     auth.authorization_code,
+      cardEmail:    data.customer?.email,
+      cardLast4:    auth.last4,
+      cardBin:      auth.bin,
+      // Paystack returns the issuing bank name on the authorization object
+      cardBank:     auth.bank ?? "Card",
+      cardType:     auth.card_type ?? auth.channel ?? "card",
+      cardExpMonth: auth.exp_month,
+      cardExpYear:  auth.exp_year,
+      userId:       meta.autopay_user_id,
+      // account_name comes from the customer name on the Paystack transaction
+      accountName:  data.customer?.metadata?.full_name
+                    ?? data.customer?.first_name + " " + data.customer?.last_name
+                    ?? "AutoPay User",
+    });
+    this.logger.log(`Card linked for user ${meta.autopay_user_id} | bank: ${auth.bank} | last4: ${auth.last4}`);
+  }
+
+  if (meta.autopay_action === "PLAN_UPGRADE") {
+    // Card payment for a plan upgrade succeeded — activate the plan
+    await this.plansService.activatePlan(
+      meta.autopay_user_id,
+      meta.autopay_plan,
+      data.reference,
+    );
+    this.logger.log(`Plan upgraded via webhook: user=${meta.autopay_user_id} plan=${meta.autopay_plan}`);
+  } 
+
+  if (meta.autopay_action === "PLATFORM_FEE") {
+    await this.prisma.transaction.updateMany({
+      where: { feeRef: data.reference },
+      data:  { feeStatus: "success" },
+    });
+    this.logger.log(`Platform fee confirmed: ${data.reference}`);
+  }
+}
 
     // ── Handle transfer outcomes ──────────────────────────────────────────
     if (event === "transfer.success") {

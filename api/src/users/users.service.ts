@@ -1,17 +1,16 @@
+import { getPlanLimits, effectivePlan } from "../plans/plans.constants";
 import {
-  Injectable, NotFoundException, ConflictException, BadRequestException,
+  Injectable, NotFoundException, ConflictException, BadRequestException, ForbiddenException
 } from "@nestjs/common";
 import * as bcrypt          from "bcrypt";
 import { PrismaService }   from "../common/prisma/prisma.service";
 import { UpdateProfileDto } from "./dto/update-profile.dto";
 import { UpdateSettingsDto } from "./dto/update-settings.dto";
-import { LinkBankDto }      from "./dto/link-bank.dto";
 import axios                from "axios";
 import { v4 as uuid }       from "uuid";
 import { ConfigService }    from "@nestjs/config";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-const LINKING_FEE_KOBO = 5_000;   // ₦50 in kobo
+const LINKING_FEE_KOBO  = 5_000;   // ₦50 in kobo
 const LINKING_FEE_NAIRA = 50;
 
 @Injectable()
@@ -27,19 +26,16 @@ export class UsersService {
 
   // ── Profile ───────────────────────────────────────────────────────────────
   async getProfile(userId: string) {
-    const user = await this.prisma.user.findUniqueOrThrow({
+    return this.prisma.user.findUniqueOrThrow({
       where:  { id: userId },
       select: {
         id: true, name: true, email: true, phone: true, avatarUrl: true,
         plan: true, planExpiresAt: true, betaAccess: true,
         linkingFeePaid: true,
         settings: true, createdAt: true, lastLoginAt: true,
-        _count: {
-          select: { beneficiaries: true, schedules: true, transactions: true },
-        },
+        _count: { select: { beneficiaries: true, schedules: true, transactions: true } },
       },
     });
-    return user;
   }
 
   async updateProfile(userId: string, dto: UpdateProfileDto) {
@@ -56,8 +52,8 @@ export class UsersService {
 
   async updateSettings(userId: string, dto: UpdateSettingsDto) {
     return this.prisma.user.update({
-      where: { id: userId },
-      data:  { settings: dto as any },
+      where:  { id: userId },
+      data:   { settings: dto as any },
       select: { id: true, settings: true },
     });
   }
@@ -70,7 +66,10 @@ export class UsersService {
     }
     const hash = await bcrypt.hash(newPassword, 12);
     await this.prisma.user.update({ where: { id: userId }, data: { passwordHash: hash } });
-    await this.prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+    await this.prisma.session.updateMany({
+      where: { userId, revokedAt: null },
+      data:  { revokedAt: new Date() },
+    });
     await this.prisma.auditLog.create({ data: { userId, action: "CHANGE_PASSWORD" } });
     return { message: "Password updated. Please log in again." };
   }
@@ -82,7 +81,7 @@ export class UsersService {
     return { message: "Account deactivated" };
   }
 
-  // ── Linked Bank Accounts ──────────────────────────────────────────────────
+  // ── Linked Accounts ───────────────────────────────────────────────────────
   async getLinkedAccounts(userId: string) {
     return this.prisma.linkedBankAccount.findMany({
       where:   { userId, deletedAt: null },
@@ -91,60 +90,50 @@ export class UsersService {
   }
 
   /**
-   * STEP 1 — Initiate the ₦50 card linking fee.
+   * Initiate card linking.
    *
-   * Creates a Paystack transaction, returns a checkout URL the mobile app
-   * opens in a browser/WebView. The user pays with their card.
-   * On success, Paystack hits the webhook → completeLinkAfterFee() is called.
-   *
-   * The bank account details (accountNumber, bankCode, bankName) are stored
-   * in Paystack's metadata so the webhook can complete the linking.
+   * Creates a ₦50 Paystack card-only transaction and returns the
+   * checkout URL. The mobile app opens this in a browser.
+   * No bank details are needed — Paystack returns the card's
+   * bank information in the charge.success webhook.
    */
-  async initiateLinkFee(userId: string, dto: LinkBankDto) {
+  async initiateLinkFee(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    // ── Plan limit check ─────────────────────────────────────────────────────────
+    const plan   = effectivePlan(user.plan, user.planExpiresAt);
+    const limits = getPlanLimits(plan);
 
-    // Check for duplicate before charging
-    const existing = await this.prisma.linkedBankAccount.findFirst({
-      where: { userId, accountNumber: dto.accountNumber, bankCode: dto.bankCode, deletedAt: null },
+    const linkedCount = await this.prisma.linkedBankAccount.count({
+      where: { userId, deletedAt: null },
     });
-    if (existing) throw new ConflictException("This account is already linked.");
 
-    // Verify the account name via Paystack before charging the fee
-    let accountName: string;
-    try {
-      const { data } = await axios.get(
-        `https://api.paystack.co/bank/resolve?account_number=${dto.accountNumber}&bank_code=${dto.bankCode}`,
-        { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
+    if (limits.maxLinkedAccounts !== Infinity && linkedCount >= limits.maxLinkedAccounts) {
+      throw new ForbiddenException(
+        `Your ${plan} plan supports up to ${limits.maxLinkedAccounts} linked card${limits.maxLinkedAccounts === 1 ? "" : "s"}. ` +
+        `Upgrade to Personal for up to 3 cards, or Business for unlimited.`
       );
-      accountName = data.data.account_name;
-    } catch {
-      throw new BadRequestException("Could not verify account. Please check the details.");
     }
-
+    // ── End plan limit check ─────────────────────────────────────────────────────
     const callbackUrl = this.config.get<string>("PAYSTACK_CALLBACK_URL") ??
       "https://autopay-platform.netlify.app/account-linked";
 
     const reference = `AUTOPAY-LINK-${uuid().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
 
-    // Initialize Paystack transaction
     const { data } = await axios.post(
       "https://api.paystack.co/transaction/initialize",
       {
         email:        user.email,
-        amount:       LINKING_FEE_KOBO,          // ₦50 in kobo
+        amount:       LINKING_FEE_KOBO,
         currency:     "NGN",
         reference,
         callback_url: callbackUrl,
         metadata: {
-          autopay_action:   "LINK_BANK",
-          autopay_user_id:  userId,
-          account_number:   dto.accountNumber,
-          bank_code:        dto.bankCode,
-          bank_name:        dto.bankName,
-          account_name:     accountName,
-          cancel_action:    "discard",
+          autopay_action:  "LINK_BANK",
+          autopay_user_id: userId,
         },
-        channels: ["card"],   // card only — no bank transfer for this charge
+        // Card only — user pays with their debit card.
+        // Paystack returns the card's bank and account info in the webhook.
+        channels: ["card"],
       },
       { headers: { Authorization: `Bearer ${this.paystackSecret}` } },
     );
@@ -155,43 +144,42 @@ export class UsersService {
 
     return {
       reference,
-      checkoutUrl:  data.data.authorization_url,
-      accountName,
-      fee:          LINKING_FEE_NAIRA,
-      message:      `Pay ₦${LINKING_FEE_NAIRA} to link your account. Your card will also be saved to collect future service fees.`,
+      checkoutUrl: data.data.authorization_url,
+      fee:         LINKING_FEE_NAIRA,
+      message:     `Pay ₦${LINKING_FEE_NAIRA} with your debit card to link it to AutoPay.`,
     };
   }
 
   /**
-   * STEP 2 — Called by the Paystack webhook after the ₦50 charge succeeds.
+   * Called by the Paystack webhook after the ₦50 card charge succeeds.
    *
-   * - Stores the card authorization_code on the user (used for future 0.1% fees)
-   * - Creates the LinkedBankAccount record
-   * - Marks linkingFeePaid = true on the user
+   * Paystack returns the card's authorization object which contains
+   * the bank name, card bin, last4, and — for Verve cards — the
+   * linked account details. We store the authorization_code for
+   * future scheduled payment debits.
    */
   async completeLinkAfterFee(payload: {
-    reference:      string;
-    authCode:       string;
-    cardEmail:      string;
-    cardLast4:      string;
-    cardBin:        string;
-    cardExpMonth:   string;
-    cardExpYear:    string;
-    userId:         string;
-    accountNumber:  string;
-    bankCode:       string;
-    bankName:       string;
-    accountName:    string;
+    reference:    string;
+    authCode:     string;
+    cardEmail:    string;
+    cardLast4:    string;
+    cardBin:      string;
+    cardBank:     string;        // bank name as returned by Paystack
+    cardType:     string;        // visa | mastercard | verve
+    cardExpMonth: string;
+    cardExpYear:  string;
+    userId:       string;
+    accountName:  string;        // cardholder name from Paystack
   }) {
     const {
       reference, authCode, cardEmail, cardLast4, cardBin,
-      cardExpMonth, cardExpYear, userId,
-      accountNumber, bankCode, bankName, accountName,
+      cardBank, cardType, cardExpMonth, cardExpYear,
+      userId, accountName,
     } = payload;
 
-    // Guard: don't double-link if webhook fires twice
+    // Guard against duplicate webhook delivery
     const duplicate = await this.prisma.linkedBankAccount.findFirst({
-      where: { userId, accountNumber, bankCode, deletedAt: null },
+      where: { userId, paystackAuthCode: authCode, deletedAt: null },
     });
     if (duplicate) return duplicate;
 
@@ -199,7 +187,7 @@ export class UsersService {
       where: { userId, deletedAt: null },
     });
 
-    // Save card auth on user for future fee collection
+    // Store card auth on the user — used for every scheduled payment debit
     await this.prisma.user.update({
       where: { id: userId },
       data:  {
@@ -209,20 +197,24 @@ export class UsersService {
       },
     });
 
-    // Create the linked bank account
+    // Create a LinkedBankAccount record using the card's bank information.
+    // accountNumber is the masked card number (bin + **** + last4) since
+    // we are linking a card, not a NUBAN bank account.
+    const maskedCard = `${cardBin}****${cardLast4}`;
+
     const account = await this.prisma.linkedBankAccount.create({
       data: {
         userId,
-        bankName,
-        bankCode,
-        accountNumber,
+        bankName:            cardBank,
+        bankCode:            cardBin,           // bin used as proxy for bank code
+        accountNumber:       maskedCard,
         accountName,
         paystackAuthCode:    authCode,
         paystackCardBin:     cardBin,
         paystackLast4:       cardLast4,
         paystackExpMonth:    cardExpMonth,
         paystackExpYear:     cardExpYear,
-        paystackChannelType: "card",
+        paystackChannelType: cardType,          // visa | mastercard | verve
         linkingFeeRef:       reference,
         linkingFeePaid:      true,
         isDefault:           count === 0,
@@ -232,21 +224,15 @@ export class UsersService {
     });
 
     await this.prisma.auditLog.create({
-      data: {
-        userId,
-        action:   "LINK_BANK_COMPLETE",
-        entity:   "LinkedBankAccount",
-        entityId: account.id,
-      },
+      data: { userId, action: "LINK_CARD_COMPLETE", entity: "LinkedBankAccount", entityId: account.id },
     });
 
-    // Notify user
     await this.prisma.alert.create({
       data: {
         userId,
         type:    "success",
-        title:   "✅ Account Linked",
-        message: `Your ${bankName} account ending in ${accountNumber.slice(-4)} has been linked successfully.`,
+        title:   "✅ Card Linked",
+        message: `Your ${cardBank} card ending in ${cardLast4} has been linked. AutoPay will use this card for scheduled payments.`,
       },
     });
 
@@ -259,31 +245,29 @@ export class UsersService {
       data:  { isDefault: false },
     });
     return this.prisma.linkedBankAccount.update({
-      where: { id: accountId, userId } as any,
+      where: { id: accountId } as any,
       data:  { isDefault: true },
     });
   }
 
   async unlinkBankAccount(userId: string, accountId: string) {
-    const has = await this.prisma.paymentSchedule.count({
+    const hasActive = await this.prisma.paymentSchedule.count({
       where: { sourceAccountId: accountId, status: "active" },
     });
-    if (has) throw new BadRequestException("This account has active schedules. Cancel them first.");
+    if (hasActive) throw new BadRequestException("This card has active schedules. Cancel them first.");
     await this.prisma.linkedBankAccount.update({
       where: { id: accountId },
       data:  { deletedAt: new Date() },
     });
     await this.prisma.auditLog.create({
-      data: { userId, action: "UNLINK_BANK", entity: "LinkedBankAccount", entityId: accountId },
+      data: { userId, action: "UNLINK_CARD", entity: "LinkedBankAccount", entityId: accountId },
     });
-    return { message: "Account unlinked" };
+    return { message: "Card unlinked" };
   }
 
-  // ── Paystack customer creation (idempotent) ───────────────────────────────
   async ensurePaystackCustomer(userId: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     if (user.paystackCustomerCode) return { customerCode: user.paystackCustomerCode };
-
     const { data } = await axios.post(
       "https://api.paystack.co/customer",
       {

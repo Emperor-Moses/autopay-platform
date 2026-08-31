@@ -1,12 +1,11 @@
 import {
   Controller, Get, Patch, Post, Delete, Body, Param, UseGuards, Req,
 } from "@nestjs/common";
-import { ApiBearerAuth, ApiTags } from "@nestjs/swagger";
+import { ApiBearerAuth, ApiOperation, ApiTags } from "@nestjs/swagger";
 import { JwtAuthGuard }       from "../auth/jwt-auth.guard";
 import { UsersService }       from "./users.service";
 import { UpdateProfileDto }   from "./dto/update-profile.dto";
 import { UpdateSettingsDto }  from "./dto/update-settings.dto";
-import { LinkBankDto }        from "./dto/link-bank.dto";
 import { ChangePasswordDto }  from "./dto/change-password.dto";
 
 @ApiTags("users")
@@ -41,9 +40,10 @@ export class UsersController {
     return this.users.deleteAccount(req.user.id);
   }
 
-  // ── Bank accounts ─────────────────────────────────────────────────────────
+  // ── Linked cards / bank accounts ──────────────────────────────────────────
 
   @Get("me/bank-accounts")
+  @ApiOperation({ summary: "List all linked cards" })
   getBankAccounts(@Req() req: any) {
     return this.users.getLinkedAccounts(req.user.id);
   }
@@ -51,14 +51,16 @@ export class UsersController {
   /**
    * POST /users/me/bank-accounts/initiate-link
    *
-   * Verifies the bank account via Paystack name-enquiry, then creates a
-   * ₦50 Paystack card charge session and returns the checkout URL.
-   * The mobile app opens this URL in a browser; on success the Paystack
-   * webhook fires and completeLinkAfterFee() creates the LinkedBankAccount.
+   * No body required.
+   * Creates a ₦50 Paystack card checkout and returns the URL.
+   * The mobile app opens this URL in a browser — when the user
+   * completes card payment, the Paystack webhook fires and
+   * completeLinkAfterFee() links the card automatically.
    */
   @Post("me/bank-accounts/initiate-link")
-  initiateLinkFee(@Req() req: any, @Body() dto: LinkBankDto) {
-    return this.users.initiateLinkFee(req.user.id, dto);
+  @ApiOperation({ summary: "Start ₦50 card linking flow — returns Paystack checkout URL" })
+  initiateLinkFee(@Req() req: any) {
+    return this.users.initiateLinkFee(req.user.id);
   }
 
   @Patch("me/bank-accounts/:id/default")
@@ -67,11 +69,10 @@ export class UsersController {
   }
 
   @Delete("me/bank-accounts/:id")
-  unlinkBank(@Req() req: any, @Param("id") id: string) {
+  unlinkCard(@Req() req: any, @Param("id") id: string) {
     return this.users.unlinkBankAccount(req.user.id, id);
   }
 
-  // ── Paystack customer ─────────────────────────────────────────────────────
   @Post("me/paystack-customer")
   ensureCustomer(@Req() req: any) {
     return this.users.ensurePaystackCustomer(req.user.id);

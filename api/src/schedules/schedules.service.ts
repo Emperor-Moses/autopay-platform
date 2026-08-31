@@ -1,3 +1,4 @@
+import { getPlanLimits, effectivePlan } from "../plans/plans.constants";
 import {
   Injectable, NotFoundException, BadRequestException, ForbiddenException,
 } from "@nestjs/common";
@@ -57,6 +58,28 @@ export class SchedulesService {
   }
 
   async create(userId: string, dto: CreateScheduleDto) {
+    // ── Plan limit check ─────────────────────────────────────────────────────────
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where:  { id: userId },
+      select: { plan: true, planExpiresAt: true },
+    });
+
+    const plan   = effectivePlan(user.plan, user.planExpiresAt);
+    const limits = getPlanLimits(plan);
+
+    if (limits.maxSchedules !== Infinity) {
+      const activeCount = await this.prisma.paymentSchedule.count({
+        where: { userId, status: "active" },
+      });
+
+      if (activeCount >= limits.maxSchedules) {
+        throw new ForbiddenException(
+          `Your ${plan} plan supports up to ${limits.maxSchedules} active schedule${limits.maxSchedules === 1 ? "" : "s"}. ` +
+          `Upgrade to Personal for unlimited schedules.`
+        );
+      }
+    }
+    // ── End plan limit check ─────────────────────────────────────────────────────
     // Resolve source account
     let sourceAccountId = dto.sourceAccountId;
     if (!sourceAccountId) {
