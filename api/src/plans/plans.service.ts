@@ -167,7 +167,7 @@ export class PlansService {
         action:   "PLAN_ACTIVATED",
         entity:   "User",
         entityId: userId,
-        metadata: { plan, reference, expiresAt } as any,
+        changes:  { plan, reference, expiresAt },
       },
     });
 
@@ -201,7 +201,7 @@ export class PlansService {
         action:   "PLAN_CANCELLED",
         entity:   "User",
         entityId: userId,
-        metadata: { plan: user.plan, expiresAt: user.planExpiresAt } as any,
+        changes:  { plan: user.plan, expiresAt: user.planExpiresAt },
       },
     });
 

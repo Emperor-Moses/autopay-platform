@@ -114,7 +114,7 @@ npm run start:dev
 ```
 
 The API starts on `http://localhost:3000`. Swagger docs are available at
-`http://localhost:3000/api` (check `main.ts` for the exact mount path).
+`http://localhost:3000/docs`.
 
 ## 5. Connect the mobile app
 
@@ -164,3 +164,22 @@ with matching class definitions. The same split was needed for
 Four standard NestJS project files were missing from the upload and have
 been added: `nest-cli.json`, `tsconfig.json`, `tsconfig.build.json`, and
 `.gitignore`. Without these, `nest build` / `nest start` cannot run.
+
+
+## Render deployment
+
+The API includes a Dockerfile and `render.yaml` for Render. Configure the Render web service with the `api` directory as its root (the Blueprint already does this). The container runs Prisma migrations before starting NestJS.
+
+Required Render environment variables:
+- `DATABASE_URL`
+- `JWT_SECRET`
+- `REDIS_URL` (prefer `rediss://...` for Upstash)
+- `PAYSTACK_SECRET_KEY`
+- `PAYSTACK_PUBLIC_KEY`
+- `PAYSTACK_CALLBACK_URL`
+- `DIRECT_DEBIT_CALLBACK_URL`
+- `FRONTEND_URLS`
+
+Do not upload or commit `.env`. Use `.env.example` as the template.
+
+Health check: `/api/v1/health`.

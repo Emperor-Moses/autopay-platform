@@ -45,3 +45,8 @@ present in the upload were identified and added:
 
 See `mobile/BUILD_GUIDE.md` and `api/BUILD_GUIDE.md` for the full detail
 on what was reorganised in each project.
+
+
+## Production deployment
+
+The backend is Render-ready. Deploy `api/` as a Docker web service using the included `api/Dockerfile` and `render.yaml`. Configure secrets in Render environment variables; `.env` is intentionally excluded from the corrected package.

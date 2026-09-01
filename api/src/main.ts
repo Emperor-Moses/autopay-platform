@@ -10,10 +10,15 @@ async function bootstrap() {
 
   // ── Security ───────────────────────────────────────────────────────────────
   app.use(helmet());
+  const configuredOrigins = (process.env.FRONTEND_URLS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
   app.enableCors({
-    origin:      process.env.NODE_ENV === "production"
-      ? ["https://autopay.ng", "https://app.autopay.ng"]
-      : "*",
+    origin: process.env.NODE_ENV === "production"
+      ? configuredOrigins
+      : true,
     credentials: true,
   });
 
@@ -56,8 +61,8 @@ async function bootstrap() {
   });
 
   // ── Start ─────────────────────────────────────────────────────────────────
-  const port = process.env.PORT ?? 3000;
-  await app.listen(port);
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen(port, "0.0.0.0");
   logger.log(`🚀  AutoPay API running on http://localhost:${port}/api/v1`);
   logger.log(`📖  Swagger docs at  http://localhost:${port}/docs`);
 }

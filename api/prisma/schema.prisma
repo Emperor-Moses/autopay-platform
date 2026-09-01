@@ -10,6 +10,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
@@ -54,9 +55,11 @@ enum AlertType {
   info
   warn
   danger
+  success
 }
 
 enum PlanTier {
+  free
   personal
   business
   enterprise

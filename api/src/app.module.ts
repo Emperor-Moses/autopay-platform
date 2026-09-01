@@ -12,6 +12,7 @@ import { SchedulesModule }     from "./schedules/schedules.module";
 import { PaymentsModule }      from "./payments/payments.module";
 import { AlertsModule }        from "./alerts/alerts.module";
 import { JobsModule }          from "./jobs/jobs.module";
+import { HealthController }    from "./health.controller";
 
 @Module({
   imports: [
@@ -30,20 +31,38 @@ import { JobsModule }          from "./jobs/jobs.module";
     // ── BullMQ / Redis ──────────────────────────────────────────────────────
     BullModule.forRootAsync({
       inject:     [ConfigService],
-      useFactory: (cfg: ConfigService) => ({
-        redis: {
-          host:     cfg.get("REDIS_HOST", "localhost"),
-          port:     cfg.get<number>("REDIS_PORT", 6379),
-          password: cfg.get("REDIS_PASSWORD") || undefined,
-	  tls:      cfg.get("REDIS_HOST", "localhost") !== "localhost" ? {} : undefined,
-        },
-        defaultJobOptions: {
+      useFactory: (cfg: ConfigService) => {
+        const redisUrl = cfg.get<string>("REDIS_URL");
+        let redis: Record<string, any>;
+
+        if (redisUrl) {
+          const url = new URL(redisUrl);
+          redis = {
+            host: url.hostname,
+            port: Number(url.port || 6379),
+            password: url.password ? decodeURIComponent(url.password) : undefined,
+            tls: url.protocol === "rediss:" ? {} : undefined,
+          };
+        } else {
+          const host = cfg.get<string>("REDIS_HOST", "localhost");
+          redis = {
+            host,
+            port: cfg.get<number>("REDIS_PORT", 6379),
+            password: cfg.get<string>("REDIS_PASSWORD") || undefined,
+            tls: host !== "localhost" ? {} : undefined,
+          };
+        }
+
+        return {
+          redis,
+          defaultJobOptions: {
           attempts:    3,
           backoff:     { type: "exponential", delay: 5000 },
           removeOnComplete: { count: 100 },
           removeOnFail:     { count: 50 },
         },
-      }),
+      };
+      },
     }),
 
     // ── Feature modules ─────────────────────────────────────────────────────
@@ -57,5 +76,6 @@ import { JobsModule }          from "./jobs/jobs.module";
     JobsModule,
     PlansModule
   ],
+  controllers: [HealthController],
 })
 export class AppModule {}

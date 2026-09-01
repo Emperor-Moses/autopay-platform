@@ -3,6 +3,7 @@
  * Run: npx prisma db seed
  */
 import { PrismaClient, PaymentType, Frequency } from "@prisma/client";
+import type { Beneficiary } from "@prisma/client";
 import * as bcrypt from "bcrypt";
 
 const prisma = new PrismaClient();
@@ -56,7 +57,7 @@ async function main() {
     { name: "Covenant School",    bank: "UBA",           bankCode: "033", accountNumber: "3344556677", accountName: "COVENANT ACADEMY LTD" },
   ];
 
-  const beneficiaries = [];
+  const beneficiaries: Beneficiary[] = [];
   for (const b of beneficiariesData) {
     const bene = await prisma.beneficiary.upsert({
       where: { userId_accountNumber_bankCode: { userId: user.id, accountNumber: b.accountNumber, bankCode: b.bankCode } },

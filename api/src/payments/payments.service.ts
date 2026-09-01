@@ -314,9 +314,11 @@ if (event === "charge.success") {
       cardExpYear:  auth.exp_year,
       userId:       meta.autopay_user_id,
       // account_name comes from the customer name on the Paystack transaction
-      accountName:  data.customer?.metadata?.full_name
-                    ?? data.customer?.first_name + " " + data.customer?.last_name
-                    ?? "AutoPay User",
+      accountName:  data.customer?.metadata?.full_name ||
+                    [data.customer?.first_name, data.customer?.last_name]
+                      .filter(Boolean)
+                      .join(" ") ||
+                    "AutoPay User",
     });
     this.logger.log(`Card linked for user ${meta.autopay_user_id} | bank: ${auth.bank} | last4: ${auth.last4}`);
   }
