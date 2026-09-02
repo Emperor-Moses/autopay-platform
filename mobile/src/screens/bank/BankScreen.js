@@ -73,18 +73,17 @@ export default function BankScreen({ navigation }) {
   async function handleLinkCard() {
     setLinking(true);
     try {
-      // Step 1 — Ask the API to create a ₦50 Paystack checkout
-      const { checkoutUrl, reference } = await UsersAPI.initiateLinkFee();
+      // Generate the app's own deep link as the callback
+      // Paystack will redirect here after payment → browser closes automatically
+      const redirectUrl = Linking.createURL("account-linked");
 
-      // Step 2 — Open Paystack card payment page in the device browser
-      const result = await WebBrowser.openAuthSessionAsync(
-        checkoutUrl,
-        "https://autopay-platform.netlify.app/account-linked",
-      );
+      const { checkoutUrl } = await UsersAPI.initiateLinkFee(redirectUrl);
+
+      const result = await WebBrowser.openAuthSessionAsync(checkoutUrl, redirectUrl);
 
       if (result.type === "success") {
-        // User completed payment — webhook will fire and link the card.
-        // Refresh the accounts list after a short delay to pick it up.
+        // Browser closed after successful redirect — webhook is already
+        // processing the linking in the background
         showToast("Payment received — linking your card…");
         setTimeout(() => {
           queryClient.invalidateQueries({ queryKey: ["bankAccounts"] });

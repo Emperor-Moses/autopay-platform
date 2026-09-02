@@ -17,8 +17,8 @@ export const UsersAPI = {
    * Open checkoutUrl in WebBrowser — on success the webhook links the card.
    * No payload needed.
    */
-  initiateLinkFee: () =>
-    api.post("/users/me/bank-accounts/initiate-link").then((r) => r.data),
+  initiateLinkFee:   (callbackUrl) =>
+    api.post("/users/me/bank-accounts/initiate-link", { callbackUrl }).then((r) => r.data),
 
   setDefaultAccount: (id) =>
     api.patch(`/users/me/bank-accounts/${id}/default`).then((r) => r.data),

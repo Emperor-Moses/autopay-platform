@@ -97,7 +97,7 @@ export class UsersService {
    * No bank details are needed — Paystack returns the card's
    * bank information in the charge.success webhook.
    */
-  async initiateLinkFee(userId: string) {
+  async initiateLinkFee(userId: string, mobileCallbackUrl?: string) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } });
     // ── Plan limit check ─────────────────────────────────────────────────────────
     const plan   = effectivePlan(user.plan, user.planExpiresAt);
@@ -114,8 +114,9 @@ export class UsersService {
       );
     }
     // ── End plan limit check ─────────────────────────────────────────────────────
-    const callbackUrl = this.config.get<string>("PAYSTACK_CALLBACK_URL") ??
-      "https://autopay-platform.netlify.app/account-linked";
+    const callbackUrl = mobileCallbackUrl ??
+      this.config.get<string>("PAYSTACK_CALLBACK_URL") ??
+      "https://autopay-platform.onrender.com/api/v1/account-linked";
 
     const reference = `AUTOPAY-LINK-${uuid().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
 

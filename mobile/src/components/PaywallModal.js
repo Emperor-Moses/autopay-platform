@@ -5,9 +5,9 @@ import {
 } from "react-native";
 import * as WebBrowser            from "expo-web-browser";
 import { useMutation }            from "@tanstack/react-query";
-import { COLORS }                 from "../../theme";
-import { PlansAPI }               from "../../api/plans";
-import { useToast }               from "../../context/ToastContext";
+import { COLORS }   from "../theme";
+import { PlansAPI } from "../api/plans";
+import { useToast } from "../context/ToastContext";
 
 /**
  * Usage — import and render wherever a plan limit might be hit:

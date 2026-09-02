@@ -5,11 +5,11 @@ import {
 } from "react-native";
 import { useQuery, useMutation }       from "@tanstack/react-query";
 import * as WebBrowser                 from "expo-web-browser";
-import { COLORS }                      from "../../theme";
-import { PlansAPI }                    from "../../api/plans";
-import { apiErrorMessage }             from "../../api/client";
-import { useToast }                    from "../../context/ToastContext";
-import ScreenHeader                    from "../../components/ScreenHeader";
+import { COLORS }          from "../theme";
+import { PlansAPI }        from "../api/plans";
+import { apiErrorMessage } from "../api/client";
+import { useToast }        from "../context/ToastContext";
+import ScreenHeader                    from "../components/ScreenHeader";
 
 const PLANS = [
   {

@@ -19,7 +19,7 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
-// ── Auto-refresh on 401 ─────────────────────────────────────────────────────
+// ── Auto-refresh on 401 ───────────────────────────────────────────────────
 let isRefreshing = false;
 let queue = [];
 
@@ -27,7 +27,13 @@ api.interceptors.response.use(
   (res) => res,
   async (error) => {
     const { config, response } = error;
-    if (response?.status === 401 && !config._retry) {
+
+    // Never intercept auth endpoints — pass errors straight through
+    const isAuthRoute = config?.url?.includes("/auth/login") ||
+                        config?.url?.includes("/auth/register") ||
+                        config?.url?.includes("/auth/refresh");
+
+    if (response?.status === 401 && !config._retry && !isAuthRoute) {
       config._retry = true;
 
       if (isRefreshing) {
@@ -39,7 +45,12 @@ api.interceptors.response.use(
       isRefreshing = true;
       try {
         const refreshToken = await SecureStore.getItemAsync(REFRESH_KEY);
-        if (!refreshToken) throw new Error("No refresh token");
+        if (!refreshToken) {
+          // No session — clear and let the UI handle it
+          await SecureStore.deleteItemAsync(TOKEN_KEY);
+          await SecureStore.deleteItemAsync(REFRESH_KEY);
+          return Promise.reject(error);
+        }
 
         const { data } = await axios.post(`${API_URL}/auth/refresh`, { refreshToken });
         await SecureStore.setItemAsync(TOKEN_KEY, data.accessToken);
@@ -58,11 +69,12 @@ api.interceptors.response.use(
         queue = [];
         await SecureStore.deleteItemAsync(TOKEN_KEY);
         await SecureStore.deleteItemAsync(REFRESH_KEY);
-        throw err;
+        return Promise.reject(err);
       } finally {
         isRefreshing = false;
       }
     }
+
     return Promise.reject(error);
   }
 );

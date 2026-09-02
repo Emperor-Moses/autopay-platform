@@ -58,9 +58,8 @@ export class UsersController {
    * completeLinkAfterFee() links the card automatically.
    */
   @Post("me/bank-accounts/initiate-link")
-  @ApiOperation({ summary: "Start ₦50 card linking flow — returns Paystack checkout URL" })
-  initiateLinkFee(@Req() req: any) {
-    return this.users.initiateLinkFee(req.user.id);
+  initiateLinkFee(@Req() req: any, @Body() body: { callbackUrl?: string }) {
+    return this.users.initiateLinkFee(req.user.id, body.callbackUrl);
   }
 
   @Patch("me/bank-accounts/:id/default")
