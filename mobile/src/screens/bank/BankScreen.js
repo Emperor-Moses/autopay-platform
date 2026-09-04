@@ -5,6 +5,7 @@ import {
 } from "react-native";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import * as WebBrowser                           from "expo-web-browser";
+import * as Linking                              from "expo-linking";
 import { COLORS }                                from "../../theme";
 import { UsersAPI }                              from "../../api/users";
 import { apiErrorMessage }                       from "../../api/client";
