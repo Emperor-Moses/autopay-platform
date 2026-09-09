@@ -5,7 +5,6 @@ import {
 } from "react-native";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import * as WebBrowser                           from "expo-web-browser";
-import * as Linking                              from "expo-linking";
 import { COLORS }                                from "../../theme";
 import { UsersAPI }                              from "../../api/users";
 import { apiErrorMessage }                       from "../../api/client";
@@ -74,24 +73,18 @@ export default function BankScreen({ navigation }) {
   async function handleLinkCard() {
     setLinking(true);
     try {
-      // Generate the app's own deep link as the callback
-      // Paystack will redirect here after payment → browser closes automatically
-      const redirectUrl = Linking.createURL("account-linked");
+      const { checkoutUrl } = await UsersAPI.initiateLinkFee();
 
-      const { checkoutUrl } = await UsersAPI.initiateLinkFee(redirectUrl);
+      await WebBrowser.openBrowserAsync(checkoutUrl, {
+        dismissButtonStyle: "done",
+        presentationStyle: WebBrowser.WebBrowserPresentationStyle.FORM_SHEET,
+      });
 
-      const result = await WebBrowser.openAuthSessionAsync(checkoutUrl, redirectUrl);
+      showToast("Checking for linked card…");
+      setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ["bankAccounts"] });
+      }, 2000);
 
-      if (result.type === "success") {
-        // Browser closed after successful redirect — webhook is already
-        // processing the linking in the background
-        showToast("Payment received — linking your card…");
-        setTimeout(() => {
-          queryClient.invalidateQueries({ queryKey: ["bankAccounts"] });
-        }, 3000);
-      } else {
-        showToast("Card linking cancelled", "error");
-      }
     } catch (e) {
       showToast(apiErrorMessage(e, "Could not start card linking"), "error");
     } finally {
