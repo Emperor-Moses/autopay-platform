@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from "@nestjs/config";
 import { ThrottlerModule } from "@nestjs/throttler";
 import { BullModule } from "@nestjs/bull";
 
+import { PaymentCallbackController } from "./payment-callback.controller";
 import { PrismaModule }        from "./common/prisma/prisma.module";
 import { AuthModule }          from "./auth/auth.module";
 import { UsersModule }         from "./users/users.module";
@@ -15,6 +16,7 @@ import { JobsModule }          from "./jobs/jobs.module";
 import { HealthController }    from "./health.controller";
 
 @Module({
+  
   imports: [
     // ── Config ─────────────────────────────────────────────────────────────
     ConfigModule.forRoot({ isGlobal: true, envFilePath: ".env" }),
@@ -76,6 +78,7 @@ import { HealthController }    from "./health.controller";
     JobsModule,
     PlansModule
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, PaymentCallbackController],
+  
 })
 export class AppModule {}

@@ -116,7 +116,7 @@ export class UsersService {
     // ── End plan limit check ─────────────────────────────────────────────────────
     const callbackUrl = mobileCallbackUrl ??
       this.config.get<string>("PAYSTACK_CALLBACK_URL") ??
-      "https://autopay-platform.onrender.com/api/v1/account-linked";
+      "https://autopay-platform.onrender.com/account-linked";
 
     const reference = `AUTOPAY-LINK-${uuid().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
 
