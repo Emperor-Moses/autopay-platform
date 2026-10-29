@@ -1,13 +1,13 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import * as SecureStore from "expo-secure-store";
-import { AuthAPI } from "../api/auth";
-import { UsersAPI } from "../api/users";
+import { AuthAPI }      from "../api/auth";
+import { UsersAPI }     from "../api/users";
 import { TOKEN_KEY, REFRESH_KEY, apiErrorMessage } from "../api/client";
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
+  const [user,    setUser]    = useState(null);
   const [booting, setBooting] = useState(true);
 
   // ── Boot: check for stored token, fetch profile ──────────────────────────
@@ -28,6 +28,7 @@ export function AuthProvider({ children }) {
     })();
   }, []);
 
+  // ── Login ─────────────────────────────────────────────────────────────────
   const login = useCallback(async (email, password) => {
     try {
       const data = await AuthAPI.login({ email, password, deviceInfo: "Expo App" });
@@ -40,6 +41,7 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+  // ── Register ──────────────────────────────────────────────────────────────
   const register = useCallback(async (name, email, password, phone) => {
     try {
       const data = await AuthAPI.register({ name, email, password, phone });
@@ -52,6 +54,7 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+  // ── Logout ────────────────────────────────────────────────────────────────
   const logout = useCallback(async () => {
     try {
       const refreshToken = await SecureStore.getItemAsync(REFRESH_KEY);
@@ -65,6 +68,7 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+  // ── Refresh profile ───────────────────────────────────────────────────────
   const refreshProfile = useCallback(async () => {
     try {
       const profile = await UsersAPI.me();
@@ -74,8 +78,38 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+  // ── Request password reset (sends email) ──────────────────────────────────
+  const requestPasswordReset = useCallback(async (email) => {
+    try {
+      await AuthAPI.forgotPassword(email);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: apiErrorMessage(err, "Could not send reset link. Try again.") };
+    }
+  }, []);
+
+  // ── Complete password reset (called from ResetPasswordScreen) ─────────────
+  const resetPassword = useCallback(async (email, token, newPassword) => {
+    try {
+      await AuthAPI.resetPassword(email, token, newPassword);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: apiErrorMessage(err, "Could not reset password. The link may have expired.") };
+    }
+  }, []);
+
   return (
-    <AuthContext.Provider value={{ user, booting, login, register, logout, refreshProfile, setUser }}>
+    <AuthContext.Provider value={{
+      user,
+      booting,
+      login,
+      register,
+      logout,
+      refreshProfile,
+      setUser,
+      requestPasswordReset,
+      resetPassword,
+    }}>
       {children}
     </AuthContext.Provider>
   );

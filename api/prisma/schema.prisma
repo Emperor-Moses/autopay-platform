@@ -74,6 +74,8 @@ model User {
   passwordHash  String
   phone         String?
   pin           String?              // hashed 4-digit transaction PIN
+  passwordResetToken    String?
+  passwordResetExpiry   DateTime?
   avatarUrl     String?
 
   // Plan / subscription

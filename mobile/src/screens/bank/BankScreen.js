@@ -11,6 +11,7 @@ import { apiErrorMessage }                       from "../../api/client";
 import { useToast }                              from "../../context/ToastContext";
 import ScreenHeader                              from "../../components/ScreenHeader";
 import Button                                    from "../../components/Button";
+import { RefreshControl } from "react-native";
 
 // ── Card type colours ────────────────────────────────────────────────────────
 function cardColor(type = "") {
@@ -91,7 +92,15 @@ export default function BankScreen({ navigation }) {
       setLinking(false);
     }
   }
+  // Add state ─────────────────────────────────────────────────────────────────
+  const [refreshing, setRefreshing] = useState(false);
 
+  async function onRefresh() {
+    setRefreshing(true);
+    await queryClient.invalidateQueries({ queryKey: ["bankAccounts"] });
+    setRefreshing(false);
+  }
+  
   // ── Render ─────────────────────────────────────────────────────────────────
   const accounts = accountsQ.data ?? [];
   const isLoading = accountsQ.isLoading;
@@ -100,7 +109,12 @@ export default function BankScreen({ navigation }) {
     <View style={{ flex: 1, backgroundColor: COLORS.bg }}>
       <ScreenHeader title="Linked Cards" onBack={() => navigation.goBack()} />
 
-      <ScrollView contentContainerStyle={styles.scroll}>
+      <ScrollView 
+      contentContainerStyle={styles.scroll}
+      refreshControl={
+        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.green} />
+          }
+        >
 
         {/* ── Info banner ── */}
         <View style={styles.infoBanner}>
